@@ -1,0 +1,2766 @@
+-- ╔══════════════════════════════════════════════════════════════════╗
+-- ║  A.APK.PANEL — SERVER SCRIPT v11                                ║
+-- ║  ServerScriptService → Script                                   ║
+-- ║  NO SETUP — auto-creates all remotes                            ║
+-- ║  Owner: Kshusha319 (6136351097)                                 ║
+-- ╚══════════════════════════════════════════════════════════════════╝
+
+local Players       = game:GetService("Players")
+local RS            = game:GetService("ReplicatedStorage")
+local Lighting      = game:GetService("Lighting")
+local TweenSvc      = game:GetService("TweenService")
+local RunSvc        = game:GetService("RunService")
+local Debris        = game:GetService("Debris")
+local Chat          = game:GetService("Chat")
+local HttpSvc       = game:GetService("HttpService")
+local PlayerService = game:GetService("Players") -- used for global search
+local WS            = workspace
+
+-- ══════════════════════════════════════════════════════════════════
+--  AUTO-CREATE ALL REMOTES
+-- ══════════════════════════════════════════════════════════════════
+local function getOrCreate(par, class, name)
+	return par:FindFirstChild(name) or (function()
+		local o = Instance.new(class, par); o.Name = name; return o
+	end)()
+end
+
+local AdminFolder  = getOrCreate(RS,          "Folder",         "PhantomAdminRemotes")
+local AdminCmd     = getOrCreate(AdminFolder,  "RemoteEvent",    "AdminCommand")
+local AdminNotif   = getOrCreate(AdminFolder,  "RemoteEvent",    "AdminNotification")
+local AdminQuery   = getOrCreate(AdminFolder,  "RemoteFunction", "AdminQuery")
+local SearchQuery  = getOrCreate(AdminFolder,  "RemoteFunction", "SearchPlayer") -- global player search
+local ReportEvent  = getOrCreate(RS,           "RemoteEvent",    "ReportPlayer")
+local ReportQuery  = getOrCreate(RS,           "RemoteFunction", "ReportQuery")
+local TriggerEvent = getOrCreate(RS,           "RemoteEvent",    "TriggerEvent")
+local EventUpdate  = getOrCreate(RS,           "RemoteEvent",    "EventUpdate")
+
+print("[A.APK.PANEL v11] ✅ All remotes created")
+
+-- ══════════════════════════════════════════════════════════════════
+--  CONFIG
+-- ══════════════════════════════════════════════════════════════════
+local ADMIN_IDS = {6136351097} -- Kshusha319
+
+-- ══════════════════════════════════════════════════════════════════
+--  STATE TABLES
+-- ══════════════════════════════════════════════════════════════════
+local Banned        = {} -- [uid] = true | {expiry=tick()}
+local Frozen        = {} -- [uid] = true
+local Jailed        = {} -- [uid] = true
+local Cuffed        = {} -- [uid] = true
+local GodMode       = {} -- [uid] = true
+local Muted         = {} -- [uid] = true
+local Invisible     = {} -- [uid] = true
+local Protected     = {} -- [uid] = true  (immune to kick/ban by non-owners)
+local Wanted        = {} -- [uid] = starCount
+local Strikes       = {} -- [uid] = count
+local Warnings      = {} -- [uid] = {string,...}
+local Bounties      = {} -- [uid] = number
+local AdminRanks    = {} -- [uid] = "Admin"|"Mod"|"Owner"
+local SpawnedParts  = {}
+local serverLocked  = false
+local chatLocked    = false
+local ActionLog     = {} -- {time,admin,action,target}
+
+-- Report system
+local Reports       = {} -- {id, reporterName, reporterUid, reportedName, reportedUid, reason, time, status}
+local reportCounter = 0
+
+-- Lighting saved state
+local origLight = {
+	ClockTime    = Lighting.ClockTime,
+	Brightness   = Lighting.Brightness,
+	Ambient      = Lighting.Ambient,
+	FogEnd       = Lighting.FogEnd,
+	FogStart     = Lighting.FogStart,
+	FogColor     = Lighting.FogColor,
+	OutdoorAmbient = Lighting.OutdoorAmbient,
+}
+local litTween = nil
+
+-- Active event tracking
+local activeEvts = {}
+
+-- ══════════════════════════════════════════════════════════════════
+--  CORE HELPERS
+-- ══════════════════════════════════════════════════════════════════
+local function isAdmin(p)
+	if not p then return false end
+	if AdminRanks[p.UserId] then return true end
+	for _, id in ipairs(ADMIN_IDS) do if p.UserId == id then return true end end
+	if p.UserId == game.CreatorId then return true end
+	return false
+end
+
+local function isOwner(p)
+	if not p then return false end
+	for _, id in ipairs(ADMIN_IDS) do if p.UserId == id then return true end end
+	return p.UserId == game.CreatorId
+end
+
+-- Find player by partial name match (prioritises exact, then starts-with, then contains)
+local function getP(name)
+	if not name or name == "" then return nil end
+	local lo = name:lower()
+	local exact, starts, contains
+	for _, p in ipairs(Players:GetPlayers()) do
+		local pn = p.Name:lower()
+		local dn = p.DisplayName:lower()
+		if pn == lo or dn == lo then
+			return p -- instant exact match
+		elseif not starts and (pn:sub(1,#lo)==lo or dn:sub(1,#lo)==lo) then
+			starts = p
+		elseif not contains and (pn:find(lo,1,true) or dn:find(lo,1,true)) then
+			contains = p
+		end
+	end
+	return starts or contains
+end
+
+local function getHum(p)  local c=p and p.Character; return c and c:FindFirstChildOfClass("Humanoid") end
+local function getHRP(p)  local c=p and p.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+local function getHead(p) local c=p and p.Character; return c and c:FindFirstChild("Head") end
+
+-- Notify a single admin client
+local function notify(p, msg, t)
+	if p and p.Parent then AdminNotif:FireClient(p, msg, t or "info") end
+end
+
+-- Notify all admins online
+local function notifyAdmins(msg, t)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if isAdmin(p) then notify(p, msg, t or "info") end
+	end
+end
+
+-- In-world hint/message broadcast
+local function announce(msg, col, dur)
+	local h = Instance.new("Hint", WS); h.Text = msg; Debris:AddItem(h, dur or 5)
+	local m = Instance.new("Message", WS); m.Text = msg; Debris:AddItem(m, dur or 5)
+end
+
+-- Private notification bubble above player's head (visible to everyone)
+local function popMsg(p, msg, col)
+	if not p then return end
+	local hrp = getHRP(p)
+	if not hrp then notify(p, msg, "info"); return end
+	-- Remove old bubble
+	local old = hrp:FindFirstChild("PA_PopBubble"); if old then old:Destroy() end
+	col = col or Color3.fromRGB(99,102,241)
+	local bb = Instance.new("BillboardGui", hrp)
+	bb.Name      = "PA_PopBubble"
+	bb.StudsOffset = Vector3.new(0, 6, 0)
+	bb.MaxDistance = 80
+	bb.AlwaysOnTop = false
+	bb.Size      = UDim2.new(0, math.clamp(#msg * 7 + 40, 100, 500), 0, 46)
+	Debris:AddItem(bb, 7)
+	local bg = Instance.new("Frame", bb)
+	bg.Size = UDim2.new(1,0,0,38)
+	bg.BackgroundColor3 = Color3.fromRGB(10,10,24)
+	bg.BorderSizePixel = 0
+	local bgc = Instance.new("UICorner", bg); bgc.CornerRadius = UDim.new(0,12)
+	local bgs = Instance.new("UIStroke", bg); bgs.Color = col; bgs.Thickness = 1.5
+	local lbl = Instance.new("TextLabel", bg)
+	lbl.Size = UDim2.new(1,-16,1,0); lbl.Position = UDim2.new(0,8,0,0)
+	lbl.BackgroundTransparency = 1; lbl.Text = msg
+	lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 14
+	lbl.TextColor3 = Color3.fromRGB(235,238,255); lbl.TextWrapped = true
+	-- Tail
+	local tri = Instance.new("Frame", bb)
+	tri.Size = UDim2.new(0,12,0,10); tri.Position = UDim2.new(0.5,-6,0,38)
+	tri.BackgroundColor3 = Color3.fromRGB(10,10,24); tri.Rotation = 45
+	Instance.new("UICorner", tri).CornerRadius = UDim.new(0,2)
+	-- Fade out after 6s
+	task.delay(6, function()
+		if bb.Parent then
+			TweenSvc:Create(bg, TweenInfo.new(0.5), {BackgroundTransparency=1}):Play()
+			TweenSvc:Create(lbl, TweenInfo.new(0.5), {TextTransparency=1}):Play()
+		end
+	end)
+end
+
+-- Light tween
+local function tweenLight(props, t)
+	if litTween and litTween.PlaybackState ~= Enum.PlaybackState.Completed then litTween:Cancel() end
+	litTween = TweenSvc:Create(Lighting, TweenInfo.new(t or 2, Enum.EasingStyle.Sine), props)
+	litTween:Play()
+end
+
+local function resetLighting()
+	tweenLight({
+		ClockTime     = origLight.ClockTime,
+		Brightness    = origLight.Brightness,
+		Ambient       = origLight.Ambient,
+		FogEnd        = origLight.FogEnd,
+		FogStart      = origLight.FogStart,
+		OutdoorAmbient= origLight.OutdoorAmbient,
+	}, 4)
+	task.delay(4.1, function()
+		Lighting.FogColor = origLight.FogColor
+	end)
+end
+
+-- Scale helper
+local function setScale(p, s)
+	local h = getHum(p); if not h then return end
+	for _, n in ipairs({"BodyDepthScale","BodyHeightScale","BodyWidthScale","HeadScale"}) do
+		local v = h:FindFirstChild(n); if v then v.Value = s end
+	end
+end
+
+-- Scale specific axes
+local function setScaleAxes(p, dv, hv, wv, hd)
+	local h = getHum(p); if not h then return end
+	local function sv(n,val) local v=h:FindFirstChild(n); if v and val then v.Value=val end end
+	sv("BodyDepthScale",dv); sv("BodyHeightScale",hv); sv("BodyWidthScale",wv); sv("HeadScale",hd)
+end
+
+-- Clear all visual effects
+local function clearFX(p)
+	local c = p and p.Character; if not c then return end
+	for _, d in ipairs(c:GetDescendants()) do
+		if d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles")
+		or d:IsA("ParticleEmitter") or d:IsA("Trail")
+		or d:IsA("PointLight") or d:IsA("SpotLight") or d:IsA("SurfaceLight") then
+			d:Destroy()
+		end
+	end
+	-- Also remove any BillboardGui effects
+	for _, d in ipairs(c:GetDescendants()) do
+		if d:IsA("BillboardGui") and d.Name:find("PA_") then d:Destroy() end
+	end
+end
+
+-- Apply FX to torso/HRP
+local function fxOn(p, fxClass, props, dur)
+	local c = p and p.Character; if not c then return end
+	local root = c:FindFirstChild("Torso") or c:FindFirstChild("UpperTorso") or c:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	-- Remove existing same type
+	for _, ch in ipairs(root:GetChildren()) do
+		if ch:IsA(fxClass) and ch.Name == "PA_"..fxClass then ch:Destroy() end
+	end
+	local fx = Instance.new(fxClass, root); fx.Name = "PA_"..fxClass
+	for k, v in pairs(props or {}) do pcall(function() fx[k] = v end) end
+	if dur then Debris:AddItem(fx, dur) end
+	return fx
+end
+
+-- Explosion
+local function blowUp(pos, r, pressure)
+	local e = Instance.new("Explosion", WS)
+	e.Position = pos; e.BlastRadius = r or 10
+	e.BlastPressure = pressure or 200000
+	Debris:AddItem(e, 3)
+end
+
+-- Skin all body parts
+local function skinAll(p, colName, mat, reflectance, transparency)
+	local c = p and p.Character; if not c then return end
+	for _, pt in ipairs(c:GetDescendants()) do
+		if pt:IsA("BasePart") and pt.Name ~= "HumanoidRootPart" then
+			if colName then pcall(function() pt.BrickColor = BrickColor.new(colName) end) end
+			if mat then pt.Material = Enum.Material[mat] end
+			if reflectance then pt.Reflectance = reflectance end
+			if transparency then pt.Transparency = transparency end
+		end
+	end
+end
+
+-- Log admin action
+local function logAction(admin, action, target)
+	local entry = {
+		time   = os.date("%H:%M:%S"),
+		admin  = admin and admin.Name or "System",
+		action = action,
+		target = target or "—"
+	}
+	table.insert(ActionLog, 1, entry)
+	if #ActionLog > 200 then ActionLog[201] = nil end
+end
+
+-- ══════════════════════════════════════════════════════════════════
+--  BUBBLE CHAT SYSTEM  (full-featured, all options)
+-- ══════════════════════════════════════════════════════════════════
+local BubbleColors = {
+	white   = Color3.fromRGB(255,255,255),
+	red     = Color3.fromRGB(255, 80, 80),
+	green   = Color3.fromRGB(80, 255,120),
+	blue    = Color3.fromRGB(80,150,255),
+	yellow  = Color3.fromRGB(255,220, 50),
+	purple  = Color3.fromRGB(180, 80,255),
+	pink    = Color3.fromRGB(255, 80,180),
+	orange  = Color3.fromRGB(255,150, 50),
+	cyan    = Color3.fromRGB(50, 220,240),
+	gold    = Color3.fromRGB(255,215,  0),
+	black   = Color3.fromRGB( 20, 20, 30),
+	admin   = Color3.fromRGB(99, 102,241),
+}
+
+local function sendBubble(p, msg, colorName, fontSize, duration, adminName)
+	if not p then return end
+	local hrp = getHRP(p); if not hrp then return end
+	msg = tostring(msg or "..."): sub(1, 200) -- cap length
+	local col   = BubbleColors[colorName] or BubbleColors.white
+	fontSize    = math.clamp(tonumber(fontSize) or 14, 10, 24)
+	duration    = math.clamp(tonumber(duration)  or 8,  2, 30)
+
+	-- Remove old bubble from this player
+	local old = hrp:FindFirstChild("PA_Bubble"); if old then old:Destroy() end
+
+	local W = math.clamp(#msg * (fontSize * 0.62) + 60, 140, 520)
+	local H = 50 + (math.ceil(#msg * fontSize * 0.62 / W) * (fontSize + 4))
+	H = math.clamp(H, 50, 160)
+
+	local bb = Instance.new("BillboardGui", hrp)
+	bb.Name        = "PA_Bubble"
+	bb.StudsOffset = Vector3.new(0, 8, 0)
+	bb.Size        = UDim2.new(0, W, 0, H)
+	bb.MaxDistance = 100
+	bb.AlwaysOnTop = false
+	Debris:AddItem(bb, duration + 1)
+
+	-- Main bubble frame
+	local bg = Instance.new("Frame", bb)
+	bg.Size              = UDim2.new(1,0,0,H-8)
+	bg.BackgroundColor3  = Color3.fromRGB(12,12,28)
+	bg.BackgroundTransparency = 0.05
+	bg.BorderSizePixel   = 0
+	local bgc = Instance.new("UICorner",bg); bgc.CornerRadius = UDim.new(0,16)
+	local bgs = Instance.new("UIStroke",bg); bgs.Color = col; bgs.Thickness = 2
+
+	-- Optional admin badge at top
+	if adminName then
+		local badge = Instance.new("TextLabel", bg)
+		badge.Size = UDim2.new(1,-12,0,14); badge.Position = UDim2.new(0,6,0,4)
+		badge.BackgroundTransparency = 1; badge.Text = "⚡ "..adminName.." (Admin)"
+		badge.Font = Enum.Font.GothamBold; badge.TextSize = 9
+		badge.TextColor3 = col; badge.TextXAlignment = Enum.TextXAlignment.Left
+	end
+
+	-- Message text
+	local lbl = Instance.new("TextLabel", bg)
+	lbl.Size     = UDim2.new(1,-16,1,-(adminName and 16 or 4))
+	lbl.Position = UDim2.new(0,8,0,adminName and 16 or 2)
+	lbl.BackgroundTransparency = 1
+	lbl.Text     = msg
+	lbl.Font     = Enum.Font.GothamBold
+	lbl.TextSize = fontSize
+	lbl.TextColor3 = Color3.fromRGB(235,238,255)
+	lbl.TextWrapped = true
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+
+	-- Tail triangle
+	local tail = Instance.new("Frame", bb)
+	tail.Size = UDim2.new(0,14,0,12); tail.Position = UDim2.new(0.12,0,0,H-20)
+	tail.BackgroundColor3 = Color3.fromRGB(12,12,28)
+	tail.Rotation = 45; tail.BorderSizePixel = 0
+	Instance.new("UICorner",tail).CornerRadius = UDim.new(0,2)
+
+	-- Left color accent
+	local accent = Instance.new("Frame", bg)
+	accent.Size = UDim2.new(0,4,0.7,0); accent.Position = UDim2.new(0,0,0.15,0)
+	accent.BackgroundColor3 = col; accent.BorderSizePixel = 0
+	Instance.new("UICorner",accent).CornerRadius = UDim.new(0,2)
+
+	-- Pop-in animation
+	bb.Size = UDim2.new(0,0,0,0)
+	TweenSvc:Create(bb, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{Size=UDim2.new(0,W,0,H)}):Play()
+
+	-- Fade out near end
+	task.delay(duration - 1, function()
+		if bb.Parent then
+			TweenSvc:Create(bg, TweenInfo.new(0.8), {BackgroundTransparency=1}):Play()
+			TweenSvc:Create(lbl, TweenInfo.new(0.8), {TextTransparency=1}):Play()
+			TweenSvc:Create(bb,  TweenInfo.new(0.8), {Size=UDim2.new(0,W*0.9,0,H*0.9)}):Play()
+		end
+	end)
+end
+
+-- ══════════════════════════════════════════════════════════════════
+--  COMMANDS TABLE
+-- ══════════════════════════════════════════════════════════════════
+local Commands = {}
+
+-- ── KICK / BAN ────────────────────────────────────────────────────
+Commands.kick = function(a, n, r)
+	local t = getP(n); if not t then return false,"Player not found" end
+	if Protected[t.UserId] and not isOwner(a) then return false,"That player is protected" end
+	t:Kick("🚫 Kicked by "..a.Name..". Reason: "..(r or "No reason given"))
+	logAction(a,"KICK",t.Name)
+	return true,"Kicked "..t.Name
+end
+
+Commands.ban = function(a, n, r)
+	local t = getP(n); if not t then return false,"Player not found" end
+	if Protected[t.UserId] and not isOwner(a) then return false,"That player is protected" end
+	Banned[t.UserId] = true
+	t:Kick("☠ Permanently banned by "..a.Name..". Reason: "..(r or "No reason given"))
+	logAction(a,"BAN",t.Name)
+	return true,"Banned "..t.Name
+end
+
+Commands.unban = function(a, n)
+	local t = getP(n)
+	if t then Banned[t.UserId] = nil; logAction(a,"UNBAN",t.Name) end
+	return true,"Unbanned "..(n or "?")
+end
+
+Commands.tempban = function(a, n, sec, r)
+	local t = getP(n); if not t then return false,"Player not found" end
+	if Protected[t.UserId] and not isOwner(a) then return false,"That player is protected" end
+	local s = tonumber(sec) or 300
+	Banned[t.UserId] = {expiry = tick() + s, reason = r or "Temp ban"}
+	t:Kick("⏱ Temp banned for "..s.."s. Reason: "..(r or "No reason"))
+	task.delay(s, function() if type(Banned[t.UserId])=="table" then Banned[t.UserId]=nil end end)
+	logAction(a,"TEMPBAN "..s.."s",t.Name)
+	return true,"Temp banned "..t.Name.." for "..s.."s"
+end
+
+Commands.kickall = function(a, r)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= a and not Protected[p.UserId] then
+			p:Kick("Kicked by admin. "..(r or ""))
+		end
+	end
+	logAction(a,"KICKALL","everyone")
+	return true,"Kicked all!"
+end
+
+Commands.protect = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Protected[t.UserId] = true
+	popMsg(t,"🛡 You have been protected by admin",Color3.fromRGB(34,211,238))
+	logAction(a,"PROTECT",t.Name)
+	return true,"Protected "..t.Name
+end
+
+Commands.unprotect = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Protected[t.UserId] = nil
+	return true,"Unprotected "..t.Name
+end
+
+-- ── TELEPORT ──────────────────────────────────────────────────────
+Commands.bring = function(a, n)
+	local t = getP(n); local aH = getHRP(a)
+	if t and aH and t.Character then
+		local h = getHRP(t); if h then h.CFrame = aH.CFrame + aH.CFrame.RightVector * 4; logAction(a,"BRING",t.Name); return true,"Brought "..t.Name end
+	end
+	return false,"Player not found or no character"
+end
+
+Commands.goto = function(a, n)
+	local t = getP(n); local aH = getHRP(a)
+	if t and aH and t.Character then
+		local h = getHRP(t); if h then aH.CFrame = h.CFrame + h.CFrame.RightVector * 4; logAction(a,"GOTO",t.Name); return true,"Went to "..t.Name end
+	end
+	return false,"Player not found"
+end
+
+Commands.teleport = function(a, n, d)
+	local t = getP(n); local dt = getP(d)
+	if t and dt and t.Character and dt.Character then
+		local h1 = getHRP(t); local h2 = getHRP(dt)
+		if h1 and h2 then h1.CFrame = h2.CFrame + h2.CFrame.RightVector * 4; return true,"Teleported "..t.Name end
+	end
+	return false,"Player(s) not found"
+end
+
+Commands.bringall = function(a)
+	local aH = getHRP(a); if not aH then return false,"No character" end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= a and p.Character then
+			local h = getHRP(p)
+			if h then h.CFrame = aH.CFrame + Vector3.new(math.random(-8,8),0,math.random(-8,8)) end
+		end
+	end
+	logAction(a,"BRINGALL","everyone")
+	return true,"Brought all!"
+end
+
+Commands.tptocoords = function(a, n, x, y, z)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHRP(t); if not h then return false,"No character" end
+	local px,py,pz = tonumber(x) or 0, tonumber(y) or 5, tonumber(z) or 0
+	h.CFrame = CFrame.new(px,py,pz)
+	return true,"TP'd "..t.Name.." to coords"
+end
+
+Commands.sendtocenter = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHRP(t); if h then h.CFrame = CFrame.new(0,5,0); return true,"Sent to center" end
+	return false,"No character"
+end
+
+Commands.randomtp = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHRP(t)
+	if h then h.CFrame = CFrame.new(math.random(-500,500),10,math.random(-500,500)); return true,"Random TP!" end
+	return false,"No character"
+end
+
+Commands.skydive = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHRP(t); if h then h.CFrame = h.CFrame + Vector3.new(0,500,0); return true,"Skydive!" end
+	return false,"No character"
+end
+
+Commands.swappos = function(a, n1, n2)
+	local t1 = getP(n1); local t2 = getP(n2)
+	if t1 and t2 then
+		local h1 = getHRP(t1); local h2 = getHRP(t2)
+		if h1 and h2 then
+			local cf = h1.CFrame; h1.CFrame = h2.CFrame; h2.CFrame = cf
+			return true,"Swapped positions"
+		end
+	end
+	return false,"Player(s) not found"
+end
+
+Commands.scatterall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		local h = getHRP(p)
+		if h then h.CFrame = CFrame.new(math.random(-200,200),10,math.random(-200,200)) end
+	end
+	return true,"Scattered all!"
+end
+
+Commands.tp_all_to_me = function(a)
+	local aH = getHRP(a); if not aH then return false,"No character" end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= a then
+			local h = getHRP(p)
+			if h then h.CFrame = aH.CFrame + Vector3.new(math.random(-6,6),0,math.random(-6,6)) end
+		end
+	end
+	return true,"All players to you!"
+end
+
+Commands.skyjail = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Jailed[t.UserId] = true
+	local h = getHRP(t); if h then h.CFrame = CFrame.new(math.random(-5,5),500,math.random(-5,5)) end
+	popMsg(t,"☁ SKY JAIL — You cannot escape",Color3.fromRGB(96,165,250))
+	logAction(a,"SKYJAIL",t.Name)
+	return true,"Sky jailed "..t.Name
+end
+
+-- ── HEALTH ────────────────────────────────────────────────────────
+Commands.kill = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	if GodMode[t.UserId] then return false,t.Name.." is in god mode" end
+	local h = getHum(t); if h then h.Health=0; logAction(a,"KILL",t.Name); return true,"Killed "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.heal = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t); if h then h.Health=h.MaxHealth; return true,"Healed "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.heal50 = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t); if h then h.Health=math.min(h.MaxHealth,h.Health+50); return true,"Healed 50hp: "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.damage = function(a, n, v)
+	local t = getP(n); if not t then return false,"Player not found" end
+	if GodMode[t.UserId] then return false,t.Name.." is god mode" end
+	local h = getHum(t); local dmg = tonumber(v) or 50
+	if h then h.Health=math.max(0,h.Health-dmg); return true,"Dealt "..dmg.."dmg to "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.maxhealth = function(a, n, v)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t); local hp = tonumber(v) or 200
+	if h then h.MaxHealth=hp; h.Health=hp; return true,"MaxHP "..hp.." → "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.sethp = function(a, n, v)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t); if h then h.Health=math.clamp(tonumber(v) or 100,0,h.MaxHealth); return true,"HP set: "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.armor = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t); if h then h.MaxHealth=300; h.Health=300; return true,"Armor (300hp): "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.killall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= a and not GodMode[p.UserId] and not Protected[p.UserId] then
+			local h = getHum(p); if h then h.Health=0 end
+		end
+	end
+	logAction(a,"KILLALL","everyone")
+	return true,"Killed all!"
+end
+
+Commands.healall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		local h = getHum(p); if h then h.Health=h.MaxHealth end
+	end
+	return true,"Healed all!"
+end
+
+Commands.respawn = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	t:LoadCharacter(); return true,"Respawned "..t.Name
+end
+
+Commands.respawnall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do p:LoadCharacter() end
+	return true,"Respawned all!"
+end
+
+Commands.refresh = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	if t.Character then
+		local pos = t.Character:GetPrimaryPartCFrame()
+		t:LoadCharacter()
+		task.delay(1.2, function()
+			if t.Character then
+				pcall(function() t.Character:SetPrimaryPartCFrame(pos) end)
+			end
+		end)
+	end
+	return true,"Refreshed "..t.Name
+end
+
+Commands.revive = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local pos = getHRP(t) and getHRP(t).CFrame or CFrame.new(0,5,0)
+	t:LoadCharacter()
+	task.delay(1.3, function()
+		local h = getHRP(t); if h then h.CFrame = pos end
+		local hm = getHum(t); if hm then hm.Health = hm.MaxHealth end
+	end)
+	return true,"Revived "..t.Name
+end
+
+Commands.healovertime = function(a, n, total, dur)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local amount = tonumber(total) or 100
+	local duration = tonumber(dur) or 10
+	local perTick = amount / (duration / 0.5)
+	task.spawn(function()
+		local elapsed = 0
+		while elapsed < duration do
+			task.wait(0.5); elapsed = elapsed + 0.5
+			local h = getHum(t); if not h then break end
+			h.Health = math.min(h.MaxHealth, h.Health + perTick)
+		end
+	end)
+	popMsg(t,"💚 Healing over "..duration.."s ("..amount.."hp)",Color3.fromRGB(16,230,120))
+	return true,"Heal over time: "..t.Name
+end
+
+-- ── GOD MODE ──────────────────────────────────────────────────────
+Commands.god = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t)
+	if h then h.MaxHealth=math.huge; h.Health=math.huge; GodMode[t.UserId]=true; logAction(a,"GOD",t.Name); return true,"God mode ON: "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.ungod = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	GodMode[t.UserId] = nil
+	local h = getHum(t)
+	if h then h.MaxHealth=100; h.Health=math.min(h.Health,100); return true,"God mode OFF: "..t.Name end
+	return true,"Ungod: "..t.Name
+end
+
+Commands.godall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		GodMode[p.UserId]=true; local h=getHum(p); if h then h.MaxHealth=math.huge; h.Health=math.huge end
+	end
+	return true,"God all!"
+end
+
+Commands.ungodall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		GodMode[p.UserId]=nil; local h=getHum(p); if h then h.MaxHealth=100; h.Health=math.min(h.Health,100) end
+	end
+	return true,"Ungod all!"
+end
+
+Commands.god_me = function(a)
+	GodMode[a.UserId]=true; local h=getHum(a); if h then h.MaxHealth=math.huge; h.Health=math.huge end
+	notify(a,"✨ God mode ON!","success"); return true,"God: you"
+end
+
+Commands.ungod_me = function(a)
+	GodMode[a.UserId]=nil; local h=getHum(a); if h then h.MaxHealth=100; h.Health=math.min(h.Health,100) end
+	return true,"Ungod: you"
+end
+
+Commands.tempgod = function(a, n, sec)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local s = tonumber(sec) or 30
+	GodMode[t.UserId]=true; local h=getHum(t); if h then h.MaxHealth=math.huge; h.Health=math.huge end
+	popMsg(t,"✨ Temporary God Mode ("..s.."s)",Color3.fromRGB(251,191,36))
+	task.delay(s, function()
+		GodMode[t.UserId]=nil; local h2=getHum(t); if h2 then h2.MaxHealth=100; h2.Health=math.min(h2.Health,100) end
+		popMsg(t,"✨ God Mode expired",Color3.fromRGB(160,165,200))
+	end)
+	return true,"TempGod "..s.."s: "..t.Name
+end
+
+-- ── SPEED / JUMP ──────────────────────────────────────────────────
+Commands.speed = function(a, n, v)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t); if h then h.WalkSpeed=math.clamp(tonumber(v) or 16,0,1000); return true,"Speed "..t.Name.." → "..tostring(v) end
+	return false,"No humanoid"
+end
+
+Commands.jumppower = function(a, n, v)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local h = getHum(t); if h then h.JumpPower=math.clamp(tonumber(v) or 50,0,1000); h.UseJumpPower=true; return true,"Jump "..t.Name end
+	return false,"No humanoid"
+end
+
+Commands.speedall = function(a, v)
+	local sp = math.clamp(tonumber(v) or 40,0,1000)
+	for _, p in ipairs(Players:GetPlayers()) do local h=getHum(p); if h then h.WalkSpeed=sp end end
+	return true,"Speed all → "..sp
+end
+
+Commands.warpspeed = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do local h=getHum(p); if h then h.WalkSpeed=500 end end
+	announce("🚀 WARP SPEED ACTIVATED!",Color3.fromRGB(34,211,238),5)
+	task.delay(10, function()
+		for _, p in ipairs(Players:GetPlayers()) do local h=getHum(p); if h then h.WalkSpeed=16 end end
+	end)
+	return true,"Warp speed!"
+end
+
+Commands.speed_me = function(a, v)
+	local h = getHum(a); if h then h.WalkSpeed=math.clamp(tonumber(v) or 48,0,1000) end
+	return true,"Your speed: "..(v or "48")
+end
+
+Commands.speedboost = function(a, n, mult, sec)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local m = tonumber(mult) or 2; local s = tonumber(sec) or 20
+	local h = getHum(t); if not h then return false,"No humanoid" end
+	local orig = h.WalkSpeed
+	h.WalkSpeed = math.clamp(orig * m, 0, 1000)
+	popMsg(t,"⚡ Speed Boost ×"..m.." for "..s.."s",Color3.fromRGB(34,211,238))
+	task.delay(s, function() local h2=getHum(t); if h2 then h2.WalkSpeed=orig end end)
+	return true,"Speed boost ×"..m.." → "..t.Name
+end
+
+Commands.jumpboost = function(a, n, mult, sec)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local m = tonumber(mult) or 3; local s = tonumber(sec) or 20
+	local h = getHum(t); if not h then return false,"No humanoid" end
+	local orig = h.JumpPower
+	h.JumpPower = math.clamp(orig * m, 0, 1000); h.UseJumpPower = true
+	popMsg(t,"🌙 Jump Boost ×"..m.." for "..s.."s",Color3.fromRGB(168,85,247))
+	task.delay(s, function() local h2=getHum(t); if h2 then h2.JumpPower=orig; h2.UseJumpPower=true end end)
+	return true,"Jump boost ×"..m.." → "..t.Name
+end
+
+-- ── FREEZE / CUFF / JAIL ──────────────────────────────────────────
+Commands.freeze = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Frozen[t.UserId] = true
+	local h = getHRP(t); if h then h.Anchored=true end
+	local hm = getHum(t); if hm then hm.WalkSpeed=0; hm.JumpPower=0 end
+	popMsg(t,"🥶 You have been frozen",Color3.fromRGB(34,211,238))
+	logAction(a,"FREEZE",t.Name)
+	return true,"Frozen: "..t.Name
+end
+
+Commands.unfreeze = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Frozen[t.UserId] = nil
+	local h = getHRP(t); if h then h.Anchored=false end
+	local hm = getHum(t); if hm then hm.WalkSpeed=16; hm.JumpPower=50 end
+	popMsg(t,"🔓 Unfrozen",Color3.fromRGB(16,230,120))
+	return true,"Unfrozen: "..t.Name
+end
+
+Commands.freezeall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= a then
+			Frozen[p.UserId]=true
+			local h=getHRP(p); if h then h.Anchored=true end
+			local hm=getHum(p); if hm then hm.WalkSpeed=0; hm.JumpPower=0 end
+		end
+	end
+	logAction(a,"FREEZEALL","everyone")
+	return true,"Froze all!"
+end
+
+Commands.unfreezeall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		Frozen[p.UserId]=nil
+		local h=getHRP(p); if h then h.Anchored=false end
+		local hm=getHum(p); if hm then hm.WalkSpeed=16; hm.JumpPower=50 end
+	end
+	return true,"Unfroze all!"
+end
+
+Commands.freeze_all_except_me = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= a then
+			Frozen[p.UserId]=true
+			local h=getHRP(p); if h then h.Anchored=true end
+			local hm=getHum(p); if hm then hm.WalkSpeed=0; hm.JumpPower=0 end
+		end
+	end
+	return true,"Froze all except you!"
+end
+
+Commands.freeze_time = function(a)
+	Commands.freezeall(a)
+	announce("⏸ TIME FROZEN",Color3.fromRGB(34,211,238),3)
+	return true,"Time frozen!"
+end
+
+Commands.unfreeze_time = function(a)
+	Commands.unfreezeall(a)
+	announce("▶ TIME UNFROZEN",Color3.fromRGB(16,230,120),3)
+	return true,"Time unfrozen!"
+end
+
+Commands.cuff = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Cuffed[t.UserId]=true; local h=getHum(t); if h then h.WalkSpeed=0; h.JumpPower=0 end
+	popMsg(t,"🔐 You have been cuffed",Color3.fromRGB(96,165,250))
+	logAction(a,"CUFF",t.Name)
+	return true,"Cuffed: "..t.Name
+end
+
+Commands.uncuff = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Cuffed[t.UserId]=nil; local h=getHum(t); if h then h.WalkSpeed=16; h.JumpPower=50 end
+	popMsg(t,"🔓 Uncuffed",Color3.fromRGB(16,230,120))
+	return true,"Uncuffed: "..t.Name
+end
+
+Commands.jail = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Jailed[t.UserId]=true
+	local h = getHRP(t); if h then h.CFrame=CFrame.new(0,150,0) end
+	popMsg(t,"🔒 You have been jailed",Color3.fromRGB(168,85,247))
+	logAction(a,"JAIL",t.Name)
+	return true,"Jailed: "..t.Name
+end
+
+Commands.unjail = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Jailed[t.UserId]=nil
+	local h = getHRP(t); if h then h.CFrame=CFrame.new(0,5,0) end
+	popMsg(t,"🔓 Released from jail",Color3.fromRGB(16,230,120))
+	return true,"Unjailed: "..t.Name
+end
+
+Commands.arrest = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Cuffed[t.UserId]=true; Jailed[t.UserId]=true
+	local h=getHRP(t); if h then h.CFrame=CFrame.new(0,150,0) end
+	local hm=getHum(t); if hm then hm.WalkSpeed=0; hm.JumpPower=0 end
+	popMsg(t,"🚔 You have been ARRESTED",Color3.fromRGB(251,146,60))
+	announce("🚔 "..t.Name.." has been arrested!",Color3.fromRGB(251,146,60),6)
+	logAction(a,"ARREST",t.Name)
+	return true,"Arrested: "..t.Name
+end
+
+Commands.unarrest = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Cuffed[t.UserId]=nil; Jailed[t.UserId]=nil
+	local hm=getHum(t); if hm then hm.WalkSpeed=16; hm.JumpPower=50 end
+	local h=getHRP(t); if h then h.CFrame=CFrame.new(0,5,0) end
+	popMsg(t,"🔓 Released from arrest",Color3.fromRGB(16,230,120))
+	return true,"Unarrested: "..t.Name
+end
+
+Commands.isolate = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Muted[t.UserId]=true; Cuffed[t.UserId]=true
+	local hm=getHum(t); if hm then hm.WalkSpeed=0; hm.JumpPower=0 end
+	popMsg(t,"🔇 Isolated — muted & cuffed",Color3.fromRGB(90,95,130))
+	logAction(a,"ISOLATE",t.Name)
+	return true,"Isolated: "..t.Name
+end
+
+-- ── MUTE / WARN ───────────────────────────────────────────────────
+Commands.mute = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Muted[t.UserId]=true
+	popMsg(t,"🔇 You have been muted by admin",Color3.fromRGB(251,191,36))
+	logAction(a,"MUTE",t.Name)
+	return true,"Muted: "..t.Name
+end
+
+Commands.unmute = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Muted[t.UserId]=nil
+	popMsg(t,"🔊 You have been unmuted",Color3.fromRGB(16,230,120))
+	return true,"Unmuted: "..t.Name
+end
+
+Commands.warn = function(a, n, r)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Warnings[t.UserId] = Warnings[t.UserId] or {}
+	local reason = r or "No reason given"
+	table.insert(Warnings[t.UserId], reason)
+	local count = #Warnings[t.UserId]
+	popMsg(t,"⚠ WARNING "..count..": "..reason,Color3.fromRGB(251,191,36))
+	notify(a,"⚠ Warned "..t.Name.." ("..count.." total)","warning")
+	logAction(a,"WARN ("..count..")",t.Name)
+	if count >= 3 then
+		announce("⚠ "..t.Name.." has reached "..count.." warnings!",Color3.fromRGB(251,191,36),6)
+		notifyAdmins("⚠ "..t.Name.." has "..count.." warnings — consider action","warning")
+	end
+	return true,"Warned "..t.Name.." ("..count..")"
+end
+
+Commands.warnings = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	local w = Warnings[t.UserId] or {}
+	local msg = t.Name.." has "..#w.." warning(s)"
+	if #w > 0 then
+		for i,r in ipairs(w) do msg = msg.."\n  "..i..". "..r end
+	end
+	notify(a, msg, "info")
+	return true, msg
+end
+
+Commands.clearwarnings = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Warnings[t.UserId] = nil
+	notify(a,"Warnings cleared for "..t.Name,"success")
+	return true,"Warnings cleared: "..t.Name
+end
+
+Commands.addstrike = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Strikes[t.UserId] = (Strikes[t.UserId] or 0) + 1
+	local s = Strikes[t.UserId]
+	popMsg(t,"❌ STRIKE "..s.."/3 — Final warning",Color3.fromRGB(239,68,68))
+	logAction(a,"STRIKE "..s,t.Name)
+	if s >= 3 then
+		Banned[t.UserId]=true
+		t:Kick("☠ 3 strikes — You are banned. Contact admins to appeal.")
+		announce("☠ "..t.Name.." received 3 strikes and was banned!",Color3.fromRGB(239,68,68),8)
+		logAction(a,"AUTO-BAN (3 strikes)",t.Name)
+	end
+	return true,"Strike "..s.."/3: "..t.Name
+end
+
+Commands.clearstrike = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Strikes[t.UserId] = nil
+	return true,"Strikes cleared: "..t.Name
+end
+
+-- ── VISIBILITY ────────────────────────────────────────────────────
+Commands.invisible = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Invisible[t.UserId]=true
+	local c = t.Character; if not c then return true,"Will apply on respawn" end
+	for _, p in ipairs(c:GetDescendants()) do
+		if p:IsA("BasePart") then p.Transparency=1
+		elseif p:IsA("Decal") or p:IsA("Texture") then p.Transparency=1 end
+	end
+	return true,"Invisible: "..t.Name
+end
+
+Commands.visible = function(a, n)
+	local t = getP(n); if not t then return false,"Player not found" end
+	Invisible[t.UserId]=nil
+	local c = t.Character; if not c then return true,"Will apply on respawn" end
+	for _, p in ipairs(c:GetDescendants()) do
+		if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then p.Transparency=0
+		elseif p:IsA("Decal") or p:IsA("Texture") then p.Transparency=0 end
+	end
+	return true,"Visible: "..t.Name
+end
+
+Commands.invisible_me = function(a)
+	Invisible[a.UserId]=true
+	local c=a.Character; if c then for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")then p.Transparency=1 end end end
+	notify(a,"👻 Invisible ON","success"); return true,"Invisible: you"
+end
+
+Commands.visible_me = function(a)
+	Invisible[a.UserId]=nil
+	local c=a.Character; if c then for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")and p.Name~="HumanoidRootPart" then p.Transparency=0 end end end
+	return true,"Visible: you"
+end
+
+Commands.visibleall = function(a)
+	for _, p in ipairs(Players:GetPlayers()) do
+		Invisible[p.UserId]=nil
+		local c=p.Character; if c then for _,pt in ipairs(c:GetDescendants())do if pt:IsA("BasePart")and pt.Name~="HumanoidRootPart" then pt.Transparency=0 end end end
+	end
+	return true,"All visible!"
+end
+
+-- ── SIZE ──────────────────────────────────────────────────────────
+Commands.giant       = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScale(t,5);return true,"Giant: "..t.Name end
+Commands.tiny        = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScale(t,0.3);return true,"Tiny: "..t.Name end
+Commands.normalsize  = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScale(t,1);return true,"Normal size: "..t.Name end
+Commands.normalsizeall=function(a) for _,p in ipairs(Players:GetPlayers())do setScale(p,1)end;return true,"Normal size all!" end
+Commands.scale       = function(a,n,v) local t=getP(n);if not t then return false,"Not found" end;setScale(t,tonumber(v) or 1);return true,"Scale: "..t.Name end
+Commands.fat         = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScaleAxes(t,3,1,3,1);return true,"Fat: "..t.Name end
+Commands.tall        = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScaleAxes(t,0.8,4,0.8,0.9);return true,"Tall: "..t.Name end
+Commands.flat        = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScaleAxes(t,0.3,0.3,3,0.5);return true,"Flat: "..t.Name end
+Commands.spaghetti   = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScaleAxes(t,0.2,8,0.2,0.5);return true,"Spaghetti: "..t.Name end
+Commands.bighead     = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScaleAxes(t,nil,nil,nil,5);return true,"Big head: "..t.Name end
+Commands.tinyhead    = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScaleAxes(t,nil,nil,nil,0.3);return true,"Tiny head: "..t.Name end
+Commands.normalhead  = function(a,n) local t=getP(n);if not t then return false,"Not found" end;setScaleAxes(t,nil,nil,nil,1);return true,"Normal head: "..t.Name end
+
+-- ── PHYSICS & FUN ────────────────────────────────────────────────
+Commands.fling = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHRP(t);if h then h.AssemblyLinearVelocity=Vector3.new(math.random(-220,220),220,math.random(-220,220));return true,"Flung: "..t.Name end
+	return false,"No character"
+end
+
+Commands.flingall = function(a)
+	for _,p in ipairs(Players:GetPlayers())do if p~=a then local h=getHRP(p);if h then h.AssemblyLinearVelocity=Vector3.new(math.random(-200,200),200,math.random(-200,200))end end end
+	return true,"Flung all!"
+end
+
+Commands.launch = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHRP(t);if h then h.AssemblyLinearVelocity=Vector3.new(0,350,0);return true,"Launched: "..t.Name end
+	return false,"No character"
+end
+
+Commands.launchall = function(a)
+	for _,p in ipairs(Players:GetPlayers())do local h=getHRP(p);if h then h.AssemblyLinearVelocity=Vector3.new(0,350,0)end end
+	return true,"Launched all!"
+end
+
+Commands.launch_me = function(a)
+	local h=getHRP(a);if h then h.AssemblyLinearVelocity=Vector3.new(0,350,0)end
+	return true,"Launched: you!"
+end
+
+Commands.spin = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	task.spawn(function()
+		for i=1,80 do
+			local h=getHRP(t);if not h then break end
+			h.CFrame=h.CFrame*CFrame.Angles(0,math.rad(28),0);task.wait(0.02)
+		end
+	end)
+	return true,"Spin: "..t.Name
+end
+
+Commands.ragdoll = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.PlatformStand=true end
+	task.delay(8,function()local h2=getHum(t);if h2 then h2.PlatformStand=false end end)
+	return true,"Ragdoll (8s): "..t.Name
+end
+
+Commands.unragdoll = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.PlatformStand=false end
+	return true,"Unragdoll: "..t.Name
+end
+
+Commands.tpose = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.PlatformStand=true end
+	task.delay(6,function()local h2=getHum(t);if h2 then h2.PlatformStand=false end end)
+	return true,"T-Pose (6s): "..t.Name
+end
+
+Commands.sit = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.Sit=true end
+	return true,"Sit: "..t.Name
+end
+
+Commands.stun = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.WalkSpeed=0;h.JumpPower=0 end
+	return true,"Stunned: "..t.Name
+end
+
+Commands.unstun = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.WalkSpeed=16;h.JumpPower=50 end
+	return true,"Unstunned: "..t.Name
+end
+
+Commands.trip = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHRP(t);if h then h.AssemblyLinearVelocity=Vector3.new(math.random(-20,20),-60,math.random(-20,20))end
+	return true,"Tripped: "..t.Name
+end
+
+Commands.clone = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local c=t.Character;if not c then return false,"No character" end
+	local cl=c:Clone();cl.Parent=WS
+	local hm=cl:FindFirstChildOfClass("Humanoid");if hm then hm.Health=0 end
+	Debris:AddItem(cl,30)
+	return true,"Cloned: "..t.Name
+end
+
+Commands.removelimbs = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local c=t.Character;if not c then return false,"No character" end
+	local limbs={"Left Arm","Right Arm","Left Leg","Right Leg","LeftUpperArm","RightUpperArm","LeftUpperLeg","RightUpperLeg","LeftLowerArm","RightLowerArm","LeftLowerLeg","RightLowerLeg","LeftHand","RightHand","LeftFoot","RightFoot"}
+	for _,ln in ipairs(limbs) do local l=c:FindFirstChild(ln);if l then l:Destroy()end end
+	return true,"Limbs removed: "..t.Name
+end
+
+-- ── EXPLOSIONS / CHAOS ────────────────────────────────────────────
+Commands.explode = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHRP(t);if h then blowUp(h.Position,10);return true,"Exploded: "..t.Name end
+	return false,"No character"
+end
+
+Commands.explodeall = function(a)
+	for _,p in ipairs(Players:GetPlayers())do if p~=a then local h=getHRP(p);if h then blowUp(h.Position,8)end end end
+	logAction(a,"EXPLODEALL","everyone");return true,"Exploded all!"
+end
+
+Commands.nukearea = function(a)
+	local hrp=getHRP(a);local pos=hrp and hrp.Position or Vector3.new(0,5,0)
+	announce("💣 NUKE INCOMING!",Color3.fromRGB(239,68,68),4)
+	for i=1,12 do task.delay(i*0.18,function()blowUp(pos+Vector3.new(math.random(-35,35),0,math.random(-35,35)),15)end)end
+	logAction(a,"NUKE","area");return true,"Nuke area!"
+end
+
+Commands.meganuke = function(a)
+	announce("☢ MEGA NUKE — 3 SECONDS!",Color3.fromRGB(239,68,68),4)
+	task.delay(2,function()
+		for i=1,30 do task.delay(i*0.15,function()blowUp(Vector3.new(math.random(-100,100),5,math.random(-100,100)),22)end)end
+		tweenLight({Brightness=10,Ambient=Color3.fromRGB(255,200,100)},0.2)
+		task.delay(4,resetLighting)
+	end)
+	logAction(a,"MEGANUKE","server");return true,"MEGA NUKE!"
+end
+
+Commands.explode_me = function(a)
+	local h=getHRP(a);if h then blowUp(h.Position,12)end;return true,"You exploded!"
+end
+
+Commands.loopkill = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	task.spawn(function()
+		for i=1,20 do task.wait(0.5);if not t.Parent then break end
+			local h=getHum(t);if h and not GodMode[t.UserId] then h.Health=0 end
+		end
+	end)
+	logAction(a,"LOOPKILL",t.Name);return true,"Loop kill: "..t.Name
+end
+
+Commands.loopexplode = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	task.spawn(function()
+		for i=1,10 do task.wait(1);local h=getHRP(t);if not h then break end;blowUp(h.Position,5)end
+	end)
+	return true,"Loop explode: "..t.Name
+end
+
+Commands.creeper = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	popMsg(t,"💣 SSSS...",Color3.fromRGB(80,200,80))
+	task.delay(3,function()local h=getHRP(t);if h then blowUp(h.Position,22)end end)
+	return true,"Creeper (3s): "..t.Name
+end
+
+Commands.chaosmode = function(a)
+	WS.Gravity=math.random(250,700)
+	tweenLight({Brightness=0.1,Ambient=Color3.fromRGB(100,0,0),ClockTime=0},0.5)
+	for _,p in ipairs(Players:GetPlayers())do
+		local h=getHRP(p);if h then h.AssemblyLinearVelocity=Vector3.new(math.random(-200,200),200,math.random(-200,200))end
+		fxOn(p,"Fire",{},20);fxOn(p,"Sparkles",{SparkleColor=Color3.fromRGB(255,0,0)},20)
+		local hm=getHum(p);if hm then hm.WalkSpeed=math.random(0,250)end
+	end
+	announce("😱 ABSOLUTE CHAOS!",Color3.fromRGB(255,0,100),8)
+	task.delay(20,function()
+		WS.Gravity=196.2;resetLighting()
+		for _,p in ipairs(Players:GetPlayers())do
+			clearFX(p);local hm=getHum(p);if hm then hm.WalkSpeed=16 end
+		end
+	end)
+	logAction(a,"CHAOSMODE","server");return true,"CHAOS MODE!"
+end
+
+Commands.earthquake = function(a)
+	for _,p in ipairs(Players:GetPlayers())do
+		task.spawn(function()
+			for i=1,40 do
+				local h=getHRP(p);if not h then break end
+				h.AssemblyLinearVelocity=Vector3.new(math.random(-40,40),math.random(8,25),math.random(-40,40))
+				task.wait(0.08)
+			end
+		end)
+	end
+	announce("🌪 EARTHQUAKE!",Color3.fromRGB(251,146,60),5)
+	return true,"Earthquake!"
+end
+
+Commands.blackhole = function(a)
+	local hrp=getHRP(a);local center=hrp and hrp.Position or Vector3.new(0,5,0)
+	announce("⫷ BLACK HOLE DETECTED!",Color3.fromRGB(168,85,247),6)
+	task.spawn(function()
+		local s=tick()
+		while tick()-s<15 do
+			for _,p in ipairs(Players:GetPlayers())do
+				if p~=a then
+					local ph=getHRP(p)
+					if ph then
+						local dir=center-ph.Position;local dist=dir.Magnitude
+						if dist>2 then ph:ApplyImpulse(dir.Unit*(1200/(dist^2))*ph.AssemblyMass*0.06)end
+					end
+				end
+			end
+			task.wait(0.05)
+		end
+	end)
+	return true,"Black hole!"
+end
+
+Commands.meteoall = function(a)
+	announce("🌠 METEOR SHOWER!",Color3.fromRGB(251,146,60),5)
+	for i=1,20 do
+		task.delay(i*0.3,function()
+			for j=1,2 do
+				local m=Instance.new("Part",WS);m.Size=Vector3.new(2.5,2.5,2.5)
+				m.Shape=Enum.PartType.Ball;m.BrickColor=BrickColor.new("Bright red");m.Material=Enum.Material.Neon
+				m.CFrame=CFrame.new(math.random(-120,120),120+math.random(0,30),math.random(-120,120))
+				m.AssemblyLinearVelocity=Vector3.new(math.random(-15,15),-95,math.random(-15,15))
+				-- Trail
+				local a0=Instance.new("Attachment",m);local a1=Instance.new("Attachment",m);a1.Position=Vector3.new(0,-2,0)
+				local tr=Instance.new("Trail",m);tr.Attachment0=a0;tr.Attachment1=a1
+				tr.Color=ColorSequence.new(Color3.fromRGB(255,120,0),Color3.fromRGB(255,60,0));tr.Lifetime=0.5
+				m.Touched:Connect(function(hit)
+					if not m.Parent then return end
+					local hm=hit.Parent and hit.Parent:FindFirstChildOfClass("Humanoid")
+					if hm then hm:TakeDamage(35)end
+					blowUp(m.Position,10,0);m:Destroy()
+				end)
+				Debris:AddItem(m,8)
+			end
+		end)
+	end
+	return true,"Meteor shower!"
+end
+
+Commands.fireworks = function(a)
+	announce("🎆 FIREWORKS!",Color3.fromRGB(236,72,153),5)
+	for i=1,25 do
+		task.delay(i*0.28,function()
+			local pos=Vector3.new(math.random(-60,60),80+math.random(0,50),math.random(-60,60))
+			local cols={Color3.fromRGB(255,0,0),Color3.fromRGB(0,255,0),Color3.fromRGB(0,100,255),
+				Color3.fromRGB(255,255,0),Color3.fromRGB(255,0,255),Color3.fromRGB(0,255,255),Color3.fromRGB(255,150,0)}
+			local col=cols[math.random(1,#cols)]
+			for j=1,8 do
+				local s=Instance.new("Part",WS);s.Size=Vector3.new(0.4,0.4,0.4)
+				s.BrickColor=BrickColor.new(col);s.Material=Enum.Material.Neon;s.Position=pos;s.CanCollide=false
+				local bv=Instance.new("BodyVelocity",s);bv.MaxForce=Vector3.new(1e5,1e5,1e5)
+				local angle=j*(2*math.pi/8)
+				bv.Velocity=Vector3.new(math.cos(angle)*math.random(15,35),math.random(-10,15),math.sin(angle)*math.random(15,35))
+				Debris:AddItem(s,2.5)
+			end
+		end)
+	end
+	return true,"Fireworks!"
+end
+
+Commands.adminflex = function(a)
+	local adminName = a.DisplayName or a.Name
+	local adminUser = a.Name
+	local msgs={
+		"😎 "..adminName.." IS ONLINE — RESPECT THE RULES OR FACE CONSEQUENCES",
+		"⚡ "..adminName.." (@"..adminUser..") IS HERE — BOW DOWN 👑",
+		"👑 THE ADMIN "..adminName.." HAS ARRIVED — BEHAVE YOURSELF",
+		"💪 "..adminName.." — A.APK.PANEL v11 — NO ESCAPING",
+		"😈 "..adminName.." — The most powerful admin has joined. Don't try anything.",
+		"🔥 "..adminName.." IS WATCHING YOU — THIS IS YOUR WARNING",
+		"⚡ YOU ARE IN "..adminName.."'S SERVER NOW. SHOW RESPECT.",
+	}
+	announce(msgs[math.random(1,#msgs)],Color3.fromRGB(251,191,36),12)
+	-- Give sparkles to all players
+	for _,p in ipairs(Players:GetPlayers()) do
+		fxOn(p,"Sparkles",{SparkleColor=Color3.fromRGB(255,220,0)},8)
+	end
+	tweenLight({Brightness=4,Ambient=Color3.fromRGB(150,120,0)},0.5)
+	task.delay(8,resetLighting)
+	-- Show admin's name above their own head
+	local hrp=getHRP(a)
+	if hrp then
+		local bb=Instance.new("BillboardGui",hrp);bb.Name="PA_FlexBB"
+		bb.StudsOffset=Vector3.new(0,7,0);bb.Size=UDim2.new(0,220,0,32);bb.MaxDistance=150
+		Debris:AddItem(bb,12)
+		local fl=Instance.new("TextLabel",bb);fl.Size=UDim2.new(1,0,1,0)
+		fl.BackgroundTransparency=1;fl.Text="👑 "..adminName.." | A.APK.PANEL"
+		fl.Font=Enum.Font.GothamBlack;fl.TextSize=14
+		fl.TextColor3=Color3.fromRGB(255,215,0);fl.TextStrokeTransparency=0.3
+	end
+	-- Notify the admin themselves
+	notify(a,"💪 ADMIN FLEX activated as "..adminName.." — All players notified!","success")
+	logAction(a,"ADMINFLEX","all players")
+	return true,"FLEXED as "..adminName.."!"
+end
+
+-- ── EFFECTS / SKINS ───────────────────────────────────────────────
+Commands.sparkles    = function(a,n) local t=getP(n);if not t then return false,"Not found" end;fxOn(t,"Sparkles",{SparkleColor=Color3.fromRGB(99,102,241)},30);return true,"Sparkles: "..t.Name end
+Commands.unsparkles  = function(a,n) local t=getP(n);if not t then return false,"Not found" end;local c=t.Character;if c then for _,d in ipairs(c:GetDescendants())do if d:IsA("Sparkles")then d:Destroy()end end end;return true,"Unsparkles: "..t.Name end
+Commands.fire        = function(a,n) local t=getP(n);if not t then return false,"Not found" end;fxOn(t,"Fire",{Size=5,Heat=9,Color=Color3.fromRGB(255,80,0),SecondaryColor=Color3.fromRGB(255,200,0)},25);return true,"Fire: "..t.Name end
+Commands.unfire      = function(a,n) local t=getP(n);if not t then return false,"Not found" end;local c=t.Character;if c then for _,d in ipairs(c:GetDescendants())do if d:IsA("Fire")then d:Destroy()end end end;return true,"Unfire: "..t.Name end
+Commands.smoke       = function(a,n) local t=getP(n);if not t then return false,"Not found" end;fxOn(t,"Smoke",{Color=Color3.fromRGB(150,150,150),Size=4,Opacity=0.6},25);return true,"Smoke: "..t.Name end
+Commands.unsmoke     = function(a,n) local t=getP(n);if not t then return false,"Not found" end;local c=t.Character;if c then for _,d in ipairs(c:GetDescendants())do if d:IsA("Smoke")then d:Destroy()end end end;return true,"Unsmoke: "..t.Name end
+Commands.cleareffects= function(a,n) local t=getP(n);if not t then return false,"Not found" end;clearFX(t);return true,"FX cleared: "..t.Name end
+Commands.clearfxall  = function(a) for _,p in ipairs(Players:GetPlayers())do clearFX(p)end;return true,"All FX cleared!" end
+
+Commands.trail = function(a, n, col1, col2)
+	local t = getP(n); if not t then return false,"Not found" end
+	local c = t.Character; if not c then return false,"No character" end
+	local hrp = c:FindFirstChild("HumanoidRootPart"); if not hrp then return false,"No HRP" end
+	-- Remove old trail
+	for _,ch in ipairs(hrp:GetChildren()) do if ch.Name=="PA_TrailA0" or ch.Name=="PA_TrailA1" or ch:IsA("Trail") then ch:Destroy()end end
+	local a0=Instance.new("Attachment",hrp);a0.Name="PA_TrailA0";a0.Position=Vector3.new(0,1,0)
+	local a1=Instance.new("Attachment",hrp);a1.Name="PA_TrailA1";a1.Position=Vector3.new(0,-1,0)
+	local tr=Instance.new("Trail",hrp);tr.Name="PA_Trail"
+	tr.Attachment0=a0;tr.Attachment1=a1;tr.Lifetime=0.7
+	local c1=BubbleColors[col1] or Color3.fromRGB(99,102,241)
+	local c2=BubbleColors[col2] or Color3.fromRGB(236,72,153)
+	tr.Color=ColorSequence.new(c1,c2);tr.MinLength=0
+	Debris:AddItem(a0,20);Debris:AddItem(a1,20);Debris:AddItem(tr,20)
+	return true,"Trail: "..t.Name
+end
+
+Commands.removetrail = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local c=t.Character;if not c then return false,"No character" end
+	for _,d in ipairs(c:GetDescendants())do if d:IsA("Trail") or (d:IsA("Attachment") and d.Name:find("PA_Trail")) then d:Destroy()end end
+	return true,"Trail removed: "..t.Name
+end
+
+Commands.goldify     = function(a,n) local t=getP(n);if not t then return false,"Not found" end;skinAll(t,"Bright yellow","SmoothPlastic");return true,"Gold: "..t.Name end
+Commands.diamond     = function(a,n) local t=getP(n);if not t then return false,"Not found" end;skinAll(t,"Cyan","Glass",0.8);return true,"Diamond: "..t.Name end
+Commands.hackerskin  = function(a,n) local t=getP(n);if not t then return false,"Not found" end;skinAll(t,"Bright green","Neon");fxOn(t,"Sparkles",{SparkleColor=Color3.fromRGB(0,255,100)},15);popMsg(t,"💚 H4CK3R SK1N",Color3.fromRGB(16,230,120));return true,"Hacker: "..t.Name end
+Commands.voidskin    = function(a,n) local t=getP(n);if not t then return false,"Not found" end;skinAll(t,"Black","Neon");fxOn(t,"Smoke",{Color=Color3.fromRGB(5,0,30),Opacity=0.9,Size=4},20);return true,"Void: "..t.Name end
+Commands.neonify     = function(a,n) local t=getP(n);if not t then return false,"Not found" end;skinAll(t,"Bright green","Neon");return true,"Neon: "..t.Name end
+Commands.ghostify    = function(a,n) local t=getP(n);if not t then return false,"Not found" end;skinAll(t,"White","Glass",nil,0.5);return true,"Ghost: "..t.Name end
+Commands.iceghost    = function(a,n) local t=getP(n);if not t then return false,"Not found" end;skinAll(t,"Cyan","Ice",nil,0.3);fxOn(t,"Sparkles",{SparkleColor=Color3.fromRGB(150,220,255)},20);return true,"Ice ghost: "..t.Name end
+
+Commands.rainbow = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	task.spawn(function()
+		local s=tick()
+		while tick()-s<20 and t.Character do
+			for _,p in ipairs(t.Character:GetDescendants())do
+				if p:IsA("BasePart")then p.BrickColor=BrickColor.new(Color3.fromHSV((tick()/4)%1,1,1))end
+			end
+			task.wait(0.05)
+		end
+	end)
+	return true,"Rainbow: "..t.Name
+end
+
+Commands.rainbowall = function(a)
+	task.spawn(function()
+		local s=tick()
+		while tick()-s<15 do
+			for _,p in ipairs(Players:GetPlayers())do
+				if p.Character then
+					for _,pt in ipairs(p.Character:GetDescendants())do
+						if pt:IsA("BasePart")then pt.BrickColor=BrickColor.new(Color3.fromHSV((tick()/4)%1,1,1))end
+					end
+				end
+			end
+			task.wait(0.05)
+		end
+	end)
+	announce("🌈 RAINBOW ALL!",Color3.fromRGB(236,72,153),5)
+	return true,"Rainbow all!"
+end
+
+Commands.resetappearance = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local c=t.Character;if not c then return false,"No character" end
+	for _,p in ipairs(c:GetDescendants())do
+		if p:IsA("BasePart") then p.Material=Enum.Material.SmoothPlastic;p.Reflectance=0;if p.Name~="HumanoidRootPart" then p.Transparency=0 end end
+	end
+	clearFX(t);setScale(t,1)
+	return true,"Reset look: "..t.Name
+end
+
+-- ── TOOLS ─────────────────────────────────────────────────────────
+Commands.givetools = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	if t.Backpack then for _,tool in ipairs(RS:GetChildren())do if tool:IsA("Tool")then tool:Clone().Parent=t.Backpack end end end
+	return true,"Tools given: "..t.Name
+end
+
+Commands.removetools = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	if t.Backpack then t.Backpack:ClearAllChildren()end
+	if t.Character then for _,item in ipairs(t.Character:GetChildren())do if item:IsA("Tool")then item:Destroy()end end end
+	return true,"Tools removed: "..t.Name
+end
+
+Commands.give_all_tools = function(a)
+	for _,p in ipairs(Players:GetPlayers())do if p.Backpack then for _,tool in ipairs(RS:GetChildren())do if tool:IsA("Tool")then tool:Clone().Parent=p.Backpack end end end end
+	return true,"Gave all tools to everyone!"
+end
+
+Commands.clear_all_tools = function(a)
+	for _,p in ipairs(Players:GetPlayers())do
+		if p.Backpack then p.Backpack:ClearAllChildren()end
+		if p.Character then for _,item in ipairs(p.Character:GetChildren())do if item:IsA("Tool")then item:Destroy()end end end
+	end
+	return true,"Cleared all tools!"
+end
+
+-- ── BUBBLE CHAT COMMAND ───────────────────────────────────────────
+-- Uses BOTH real Roblox chat (SayMessage via Chat service) AND visual bubble
+Commands.bubblechat = function(a, n, msg, colName, fontSize, duration)
+	local targets = {}
+	if n and n ~= "" and n ~= "all" then
+		local t = getP(n); if not t then return false,"Player not found" end
+		table.insert(targets, t)
+	else
+		for _,p in ipairs(Players:GetPlayers()) do table.insert(targets,p) end
+	end
+	msg = tostring(msg or "..."):sub(1,200)
+
+	local successCount = 0
+	for _, t in ipairs(targets) do
+		-- Visual bubble GUI (always works)
+		sendBubble(t, msg, colName or "white", tonumber(fontSize) or 14, tonumber(duration) or 8, a.Name)
+		-- Real chat message via Chat service (appears in chat log)
+		pcall(function()
+			-- This uses TextChatService if available, else Chat:Chat
+			local suc = pcall(function()
+				Chat:Chat(t.Character and t.Character:FindFirstChild("Head") or t.Character, msg, Enum.ChatColor.White)
+			end)
+		end)
+		successCount = successCount + 1
+	end
+	logAction(a,"BUBBLECHAT → "..msg:sub(1,30),(n and n~="" and n or "all"))
+	return true,"Bubble sent to "..successCount.." player(s): "..msg:sub(1,40)
+end
+
+-- ── COMMUNICATION ─────────────────────────────────────────────────
+Commands.message     = function(a,txt) local h=Instance.new("Message",WS);h.Text=txt or "";Debris:AddItem(h,6);return true,"Message sent!" end
+Commands.hint        = function(a,txt) local h=Instance.new("Hint",WS);h.Text=txt or "";Debris:AddItem(h,6);return true,"Hint sent!" end
+Commands.announcement= function(a,txt) announce(txt or "",Color3.fromRGB(99,102,241),7);return true,"Announced!" end
+
+Commands.pm = function(a, n, msg)
+	-- Private message from admin to player (only they see it)
+	local t=getP(n);if not t then return false,"Not found" end
+	notify(t,"📬 PM from "..a.Name..": "..(msg or ""),"info")
+	notify(a,"📬 PM sent to "..t.Name,"success")
+	return true,"PM sent to "..t.Name
+end
+
+Commands.admin_msg = function(a, msg)
+	-- Message only visible to admins
+	for _,p in ipairs(Players:GetPlayers())do
+		if isAdmin(p) then
+			notify(p,"🔐 [ADMIN] "..a.Name..": "..(msg or ""),"info")
+		end
+	end
+	return true,"Admin message sent"
+end
+
+Commands.forcechat = function(a, n, msg)
+	-- Make a player's name appear to say something in chat (server hint trick)
+	local t=getP(n);if not t then return false,"Not found" end
+	msg = msg or "..."
+	-- Use bubble chat
+	sendBubble(t, msg, "white", 14, 8, nil)
+	-- Also announce as if they said it
+	announce(t.Name..": "..msg, Color3.fromRGB(255,255,255), 5)
+	return true,"Forced chat: "..t.Name
+end
+
+Commands.spectate = function(a, n)
+	local t=getP(n);if not t then return false,"Not found" end
+	AdminNotif:FireClient(a,"SPECTATE:"..t.Name,"spectate")
+	logAction(a,"SPECTATE",t.Name)
+	return true,"Spectating "..t.Name
+end
+
+-- ── WORLD ─────────────────────────────────────────────────────────
+Commands.day        = function(a) tweenLight({ClockTime=14,Brightness=2,Ambient=Color3.fromRGB(70,70,70)},2);return true,"Day!" end
+Commands.night      = function(a) tweenLight({ClockTime=0,Brightness=0.3,Ambient=Color3.fromRGB(20,20,40)},2);return true,"Night!" end
+Commands.sunset     = function(a) tweenLight({ClockTime=18,Brightness=1.5,Ambient=Color3.fromRGB(180,100,60)},2);return true,"Sunset!" end
+Commands.sunrise    = function(a) tweenLight({ClockTime=6,Brightness=1.2,Ambient=Color3.fromRGB(200,150,100)},2);return true,"Sunrise!" end
+Commands.noon       = function(a) tweenLight({ClockTime=12,Brightness=3,Ambient=Color3.fromRGB(100,100,80)},2);return true,"Noon!" end
+Commands.midnight   = function(a) tweenLight({ClockTime=0,Brightness=0,Ambient=Color3.fromRGB(5,5,20)},2);return true,"Midnight!" end
+Commands.matrixsky  = function(a) tweenLight({Brightness=1,Ambient=Color3.fromRGB(0,100,0),ClockTime=0},2);Lighting.FogEnd=200;Lighting.FogColor=Color3.fromRGB(0,80,0);return true,"Matrix sky!" end
+Commands.bloodmoon  = function(a) tweenLight({ClockTime=0,Brightness=0.4,Ambient=Color3.fromRGB(100,0,0)},2);Lighting.FogEnd=200;Lighting.FogColor=Color3.fromRGB(80,0,0);return true,"Blood moon!" end
+Commands.redalert   = function(a) tweenLight({Brightness=0.5,Ambient=Color3.fromRGB(120,0,0),ClockTime=0},0.5);return true,"Red alert!" end
+Commands.blackout   = function(a) tweenLight({Brightness=0,Ambient=Color3.fromRGB(0,0,0)},1);return true,"Blackout!" end
+Commands.purplesky  = function(a) tweenLight({Brightness=1.5,Ambient=Color3.fromRGB(80,0,120),ClockTime=2},2);return true,"Purple sky!" end
+Commands.densefog   = function(a) Lighting.FogEnd=20;Lighting.FogStart=0;Lighting.FogColor=Color3.fromRGB(200,210,220);return true,"Dense fog!" end
+Commands.clearfog   = function(a) Lighting.FogEnd=100000;return true,"Fog cleared!" end
+Commands.toxicfog   = function(a) Lighting.FogEnd=25;Lighting.FogStart=0;Lighting.FogColor=Color3.fromRGB(50,200,50);tweenLight({Brightness=0.4,Ambient=Color3.fromRGB(0,80,0)},1);return true,"Toxic fog!" end
+Commands.rainbowsky = function(a) task.spawn(function()for i=1,40 do tweenLight({Ambient=Color3.fromHSV(i/40,0.8,0.8)},0.3);task.wait(0.3)end;resetLighting()end);return true,"Rainbow sky!" end
+Commands.resetlighting=function(a) resetLighting();return true,"Lighting reset!" end
+Commands.disco      = function(a) task.spawn(function()for i=1,30 do tweenLight({Ambient=Color3.fromHSV(i/30,0.8,0.8)},0.25);task.wait(0.25)end;resetLighting()end);return true,"Disco!" end
+Commands.strobe     = function(a) task.spawn(function()for i=1,30 do Lighting.Brightness=(i%2==0)and 0 or 3;task.wait(0.1)end;Lighting.Brightness=2 end);return true,"Strobe!" end
+
+Commands.normalgravity = function(a) WS.Gravity=196.2;return true,"Normal gravity!" end
+Commands.lowgravity    = function(a) WS.Gravity=20;return true,"Low gravity!" end
+Commands.highgravity   = function(a) WS.Gravity=600;return true,"High gravity!" end
+Commands.zerogravity   = function(a) WS.Gravity=0;return true,"Zero gravity!" end
+Commands.moonvity      = function(a) WS.Gravity=60;return true,"Moon gravity!" end
+Commands.flipgravity   = function(a) WS.Gravity=-math.abs(WS.Gravity);announce("🙃 GRAVITY FLIPPED!",Color3.fromRGB(168,85,247),5);task.delay(12,function()WS.Gravity=196.2 end);return true,"Gravity flipped!" end
+
+-- ── SERVER CONTROL ────────────────────────────────────────────────
+Commands.lockserver    = function(a) serverLocked=true;announce("🔒 Server Locked — Admins only",Color3.fromRGB(239,68,68),6);logAction(a,"LOCKSERVER","");return true,"Locked!" end
+Commands.unlockserver  = function(a) serverLocked=false;announce("🔓 Server Unlocked",Color3.fromRGB(16,230,120),6);return true,"Unlocked!" end
+Commands.lockchat      = function(a) chatLocked=true;announce("🔕 Chat Locked by admin",Color3.fromRGB(251,191,36),5);return true,"Chat locked!" end
+Commands.unlockchat    = function(a) chatLocked=false;announce("🔔 Chat Unlocked",Color3.fromRGB(16,230,120),4);return true,"Chat unlocked!" end
+
+Commands.shutdown = function(a, delay_sec)
+	local d = math.clamp(tonumber(delay_sec) or 5, 1, 60)
+	announce("⚠ SERVER SHUTTING DOWN IN "..d.." SECONDS...",Color3.fromRGB(239,68,68),d)
+	logAction(a,"SHUTDOWN","server")
+	task.delay(d, function()
+		for _,p in ipairs(Players:GetPlayers()) do p:Kick("🔴 Server was shut down by admin. Thanks for playing!") end
+	end)
+	return true,"Shutdown in "..d.."s!"
+end
+
+Commands.clearworkspace = function(a)
+	for _, obj in ipairs(WS:GetChildren()) do
+		if not obj:IsA("Terrain") and obj.Name ~= "Baseplate" then
+			pcall(function() obj:Destroy() end)
+		end
+	end
+	SpawnedParts = {}
+	logAction(a,"CLEARWS","")
+	return true,"Workspace cleared!"
+end
+
+Commands.serverinfo = function(a)
+	local info = string.format(
+		"Players: %d/%d | Gravity: %.1f | Time: %.1fh | Brightness: %.1f | PlaceId: %d",
+		#Players:GetPlayers(), Players.MaxPlayers,
+		WS.Gravity, Lighting.ClockTime, Lighting.Brightness, game.PlaceId
+	)
+	notify(a, info, "info"); return true, info
+end
+
+Commands.listplayers = function(a)
+	local names={}
+	for _,p in ipairs(Players:GetPlayers()) do
+		names[#names+1]=p.Name..(isAdmin(p) and " [A]" or "")
+	end
+	notify(a,"Players ("..#names.."): "..table.concat(names,", "),"info")
+	return true,"Listed "..#names.." players"
+end
+
+Commands.getinfo = function(a, n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t)
+	local info=string.format(
+		"%s (@%s) | ID: %d | HP: %.0f/%.0f | WS: %.0f | Warns: %d | Strikes: %d | Banned: %s | God: %s",
+		t.DisplayName, t.Name, t.UserId,
+		h and h.Health or 0, h and h.MaxHealth or 0, h and h.WalkSpeed or 0,
+		Warnings[t.UserId] and #Warnings[t.UserId] or 0,
+		Strikes[t.UserId] or 0,
+		Banned[t.UserId] and "YES" or "No",
+		GodMode[t.UserId] and "YES" or "No"
+	)
+	notify(a, info, "info"); return true, info
+end
+
+Commands.ping       = function(a) notify(a,"🏓 Pong! Server is alive and responding.","success");return true,"Pong!" end
+Commands.clearspawned=function(a) for _,p in ipairs(SpawnedParts)do if p and p.Parent then p:Destroy()end end;SpawnedParts={};return true,"Cleared spawned parts!" end
+
+Commands.music = function(a, id)
+	local existing=WS:FindFirstChild("PA_Music"); if existing then existing:Destroy()end
+	if not id or id=="" then return true,"Music stopped" end
+	local s=Instance.new("Sound",WS);s.Name="PA_Music";s.SoundId="rbxassetid://"..id;s.Volume=0.8;s.Looped=true;s:Play()
+	return true,"Now playing: "..id
+end
+
+Commands.stopmusic = function(a)
+	local s=WS:FindFirstChild("PA_Music"); if s then s:Destroy()end
+	return true,"Music stopped!"
+end
+
+Commands.volume = function(a, v)
+	local s=WS:FindFirstChild("PA_Music"); if s then s.Volume=math.clamp(tonumber(v) or 0.8,0,10)end
+	return true,"Volume: "..(v or "0.8")
+end
+
+-- ── SPAWN ─────────────────────────────────────────────────────────
+Commands.spawnpart = function(a)
+	local hrp=getHRP(a);if not hrp then return false,"No character" end
+	local p=Instance.new("Part",WS);p.Size=Vector3.new(4,1,4);p.Anchored=true
+	p.CFrame=hrp.CFrame*CFrame.new(0,-3,0);p.BrickColor=BrickColor.new("Bright blue")
+	SpawnedParts[#SpawnedParts+1]=p;return true,"Part spawned!"
+end
+
+Commands.spawnball = function(a)
+	local hrp=getHRP(a);if not hrp then return false,"No character" end
+	local p=Instance.new("Part",WS);p.Shape=Enum.PartType.Ball;p.Size=Vector3.new(5,5,5)
+	p.CFrame=hrp.CFrame*CFrame.new(0,4,-8);p.BrickColor=BrickColor.Random()
+	SpawnedParts[#SpawnedParts+1]=p;return true,"Ball spawned!"
+end
+
+Commands.killbrick = function(a)
+	local hrp=getHRP(a);if not hrp then return false,"No character" end
+	local p=Instance.new("Part",WS);p.Size=Vector3.new(12,1,12);p.Anchored=true
+	p.CFrame=hrp.CFrame*CFrame.new(0,-3,0);p.BrickColor=BrickColor.new("Bright red");p.Material=Enum.Material.Neon
+	p.Touched:Connect(function(hit)local h=hit.Parent and hit.Parent:FindFirstChildOfClass("Humanoid");if h then h.Health=0 end end)
+	SpawnedParts[#SpawnedParts+1]=p;return true,"Kill brick spawned!"
+end
+
+Commands.healpad = function(a)
+	local hrp=getHRP(a);if not hrp then return false,"No character" end
+	local p=Instance.new("Part",WS);p.Size=Vector3.new(10,1,10);p.Anchored=true
+	p.CFrame=hrp.CFrame*CFrame.new(0,-3,0);p.BrickColor=BrickColor.new("Bright green");p.Material=Enum.Material.Neon
+	p.Touched:Connect(function(hit)local h=hit.Parent and hit.Parent:FindFirstChildOfClass("Humanoid");if h then h.Health=h.MaxHealth end end)
+	SpawnedParts[#SpawnedParts+1]=p;return true,"Heal pad spawned!"
+end
+
+Commands.spawn_trampoline = function(a)
+	local hrp=getHRP(a);if not hrp then return false,"No character" end
+	local p=Instance.new("Part",WS);p.Size=Vector3.new(12,1,12);p.Anchored=true
+	p.CFrame=hrp.CFrame*CFrame.new(0,-4,0);p.BrickColor=BrickColor.new("Bright yellow");p.Material=Enum.Material.Neon
+	p.Touched:Connect(function(hit)
+		local hr=hit.Parent and hit.Parent:FindFirstChild("HumanoidRootPart")
+		if hr then hr.AssemblyLinearVelocity=Vector3.new(hr.AssemblyLinearVelocity.X,160,hr.AssemblyLinearVelocity.Z)end
+	end)
+	SpawnedParts[#SpawnedParts+1]=p;Debris:AddItem(p,120);return true,"Trampoline spawned!"
+end
+
+-- ── SIGNATURE MOVES ───────────────────────────────────────────────
+Commands.crown = function(a, n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local hrp=getHRP(t);if not hrp then return false,"No character" end
+	local crown=Instance.new("Part",WS);crown.Size=Vector3.new(3.2,0.9,3.2)
+	crown.BrickColor=BrickColor.new("Bright yellow");crown.Material=Enum.Material.Neon
+	crown.Anchored=false;crown.CanCollide=false
+	local weld=Instance.new("WeldConstraint",crown);weld.Part0=crown;weld.Part1=hrp
+	crown.CFrame=hrp.CFrame+Vector3.new(0,4.5,0)
+	Debris:AddItem(crown,60);SpawnedParts[#SpawnedParts+1]=crown
+	fxOn(t,"Sparkles",{SparkleColor=Color3.fromRGB(255,220,0)},60)
+	popMsg(t,"👑 You have been crowned",Color3.fromRGB(255,215,0))
+	return true,"Crowned: "..t.Name
+end
+
+Commands.rainbowgod = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.MaxHealth=math.huge;h.Health=math.huge;GodMode[t.UserId]=true end
+	task.spawn(function()
+		local s=tick()
+		while tick()-s<30 and t.Character do
+			for _,p in ipairs(t.Character:GetDescendants())do
+				if p:IsA("BasePart")then p.BrickColor=BrickColor.new(Color3.fromHSV((tick()/5)%1,1,1))end
+			end
+			task.wait(0.05)
+		end
+		GodMode[t.UserId]=nil;local h2=getHum(t);if h2 then h2.MaxHealth=100;h2.Health=100 end
+	end)
+	return true,"Rainbow God (30s): "..t.Name
+end
+
+Commands.firegod = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.MaxHealth=math.huge;h.Health=math.huge;GodMode[t.UserId]=true end
+	skinAll(t,"Bright red","Neon")
+	fxOn(t,"Fire",{Size=10,Heat=15,Color=Color3.fromRGB(255,80,0),SecondaryColor=Color3.fromRGB(255,200,0)},25)
+	local hrp=getHRP(t);if hrp then local pl=Instance.new("PointLight",hrp);pl.Brightness=6;pl.Range=35;pl.Color=Color3.fromRGB(255,100,0);Debris:AddItem(pl,25)end
+	popMsg(t,"🔥 FIRE GOD",Color3.fromRGB(239,68,68))
+	task.delay(25,function()GodMode[t.UserId]=nil;local h2=getHum(t);if h2 then h2.MaxHealth=100;h2.Health=100 end;clearFX(t)end)
+	return true,"Fire God (25s): "..t.Name
+end
+
+Commands.icegod = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	local h=getHum(t);if h then h.MaxHealth=math.huge;h.Health=math.huge;GodMode[t.UserId]=true end
+	skinAll(t,"Cyan","Ice")
+	fxOn(t,"Sparkles",{SparkleColor=Color3.fromRGB(150,220,255)},25)
+	local hrp=getHRP(t);if hrp then local pl=Instance.new("PointLight",hrp);pl.Brightness=4;pl.Range=30;pl.Color=Color3.fromRGB(100,200,255);Debris:AddItem(pl,25)end
+	popMsg(t,"❄ ICE GOD",Color3.fromRGB(34,211,238))
+	task.delay(25,function()GodMode[t.UserId]=nil;local h2=getHum(t);if h2 then h2.MaxHealth=100;h2.Health=100 end;clearFX(t)end)
+	return true,"Ice God (25s): "..t.Name
+end
+
+Commands.phantommode = function(a,n)
+	local t=getP(n);if not t then return false,"Not found" end
+	Invisible[t.UserId]=true
+	local c=t.Character
+	if c then
+		for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")then p.Transparency=1;p.CanCollide=false end end
+	end
+	local h=getHum(t);if h then h.WalkSpeed=30 end
+	popMsg(t,"👻 PHANTOM MODE — 25s",Color3.fromRGB(140,0,255))
+	task.delay(25,function()
+		Invisible[t.UserId]=nil
+		if t.Character then
+			for _,p in ipairs(t.Character:GetDescendants())do
+				if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then p.Transparency=0;p.CanCollide=true end
+			end
+		end
+		local h2=getHum(t);if h2 then h2.WalkSpeed=16 end
+	end)
+	return true,"Phantom mode (25s): "..t.Name
+end
+
+Commands.secretadmin = function(a)
+	Invisible[a.UserId]=true;GodMode[a.UserId]=true
+	local c=a.Character
+	if c then for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")then p.Transparency=1;p.CanCollide=false end end end
+	local h=getHum(a);if h then h.MaxHealth=math.huge;h.Health=math.huge;h.WalkSpeed=28 end
+	notify(a,"🥷 Secret admin mode ON (40s)","success")
+	task.delay(40,function()
+		Invisible[a.UserId]=nil;GodMode[a.UserId]=nil
+		if a.Character then
+			for _,p in ipairs(a.Character:GetDescendants())do
+				if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then p.Transparency=0;p.CanCollide=true end
+			end
+		end
+		local h2=getHum(a);if h2 then h2.MaxHealth=100;h2.Health=100;h2.WalkSpeed=16 end
+		notify(a,"🥷 Secret mode OFF","info")
+	end)
+	return true,"Secret admin (40s)"
+end
+
+Commands.resetself = function(a)
+	GodMode[a.UserId]=nil;Invisible[a.UserId]=nil;Frozen[a.UserId]=nil
+	local h=getHum(a);if h then h.WalkSpeed=16;h.JumpPower=50;h.MaxHealth=100;h.Health=100 end
+	clearFX(a);setScale(a,1)
+	local c=a.Character
+	if c then
+		for _,p in ipairs(c:GetDescendants())do
+			if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then
+				p.Transparency=0;p.CanCollide=true;p.Material=Enum.Material.SmoothPlastic
+			end
+		end
+	end
+	notify(a,"🔄 Self reset complete!","success")
+	return true,"Self reset!"
+end
+
+Commands.releaseall = function(a)
+	for _,p in ipairs(Players:GetPlayers())do
+		Frozen[p.UserId]=nil;Jailed[p.UserId]=nil;Cuffed[p.UserId]=nil;Invisible[p.UserId]=nil
+		local h=getHRP(p);if h then h.Anchored=false end
+		local hm=getHum(p);if hm then hm.WalkSpeed=16;hm.JumpPower=50 end
+		local c=p.Character
+		if c then for _,pt in ipairs(c:GetDescendants())do if pt:IsA("BasePart")and pt.Name~="HumanoidRootPart" then pt.Transparency=0 end end end
+		clearFX(p);setScale(p,1)
+	end
+	WS.Gravity=196.2;resetLighting()
+	announce("🕊 ALL PLAYERS RELEASED!",Color3.fromRGB(16,230,120),5)
+	logAction(a,"RELEASEALL","everyone")
+	return true,"Released all!"
+end
+
+-- Abuse shortcuts
+Commands.inffling = function(a,n) local t=getP(n);if not t then return false,"Not found" end;task.spawn(function()for i=1,30 do task.wait(0.3);local h=getHRP(t);if not h then break end;h.AssemblyLinearVelocity=Vector3.new(math.random(-200,200),200,math.random(-200,200))end end);return true,"Inf fling: "..t.Name end
+Commands.spinnightmare=function(a,n) local t=getP(n);if not t then return false,"Not found" end;task.spawn(function()for i=1,120 do local h=getHRP(t);if not h then break end;h.CFrame=h.CFrame*CFrame.Angles(0,math.rad(40),0);task.wait(0.02)end end);return true,"Spin nightmare: "..t.Name end
+Commands.shrinktodust=function(a,n) local t=getP(n);if not t then return false,"Not found" end;task.spawn(function()for i=10,0,-0.4 do local h=getHum(t);if not h then break end;for _,nm in ipairs({"BodyDepthScale","BodyHeightScale","BodyWidthScale","HeadScale"})do local v=h:FindFirstChild(nm);if v then v.Value=i/10 end end;task.wait(0.05)end end);return true,"Shrink: "..t.Name end
+Commands.blind  = function(a,n) local t=getP(n);if not t then return false,"Not found" end;AdminNotif:FireClient(t,"Blinded!","blind");return true,"Blinded: "..t.Name end
+Commands.unblind= function(a,n) local t=getP(n);if not t then return false,"Not found" end;AdminNotif:FireClient(t,"Unblinded!","unblind");return true,"Unblinded: "..t.Name end
+Commands.seizure= function(a,n) local t=getP(n);if not t then return false,"Not found" end;for i=1,20 do task.delay(i*0.1,function()AdminNotif:FireClient(t,"flash","flash")end)end;return true,"Seizure: "..t.Name end
+Commands.nightvision  =function(a,n) local t=getP(n);if not t then return false,"Not found" end;AdminNotif:FireClient(t,"NV_ON","nightvision");return true,"Night vision: "..t.Name end
+Commands.unnightvision=function(a,n) local t=getP(n);if not t then return false,"Not found" end;AdminNotif:FireClient(t,"NV_OFF","unnightvision");return true,"Night vision OFF: "..t.Name end
+Commands.noclip=function(a,n) local t=getP(n);if not t then return false,"Not found" end;task.spawn(function()local s=tick();while tick()-s<30 do local c=t.Character;if c then for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")then p.CanCollide=false end end end;task.wait(0.1)end;if t.Character then for _,p in ipairs(t.Character:GetDescendants())do if p:IsA("BasePart")then p.CanCollide=true end end end end);return true,"Noclip 30s: "..t.Name end
+Commands.clip  =function(a,n) local t=getP(n);if not t then return false,"Not found" end;local c=t.Character;if c then for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")then p.CanCollide=true end end end;return true,"Clip: "..t.Name end
+Commands.shield = function(a,n) local t=getP(n);if not t then return false,"Not found" end;if t.Character and not t.Character:FindFirstChildOfClass("ForceField")then Instance.new("ForceField",t.Character)end;return true,"Shield: "..t.Name end
+Commands.removeshield=function(a,n) local t=getP(n);if not t then return false,"Not found" end;if t.Character then local ff=t.Character:FindFirstChildOfClass("ForceField");if ff then ff:Destroy()end end;return true,"Shield removed: "..t.Name end
+Commands.wanted=function(a,n) local t=getP(n);if not t then return false,"Not found" end;Wanted[t.UserId]=5;announce("🚨 WANTED: "..t.Name.." — EXTREMELY DANGEROUS",Color3.fromRGB(239,68,68),10);logAction(a,"WANTED",t.Name);return true,"Wanted: "..t.Name end
+Commands.unwanted=function(a,n) local t=getP(n);if not t then return false,"Not found" end;Wanted[t.UserId]=nil;return true,"Unwanted: "..t.Name end
+Commands.promote=function(a,n,r) local t=getP(n);if not t then return false,"Not found" end;AdminRanks[t.UserId]=r or "Admin";notify(a,"✅ Promoted "..t.Name.." → "..(r or "Admin"),"success");logAction(a,"PROMOTE→"..(r or "Admin"),t.Name);return true,"Promoted "..t.Name end
+Commands.demote=function(a,n) local t=getP(n);if not t then return false,"Not found" end;AdminRanks[t.UserId]=nil;logAction(a,"DEMOTE",t.Name);return true,"Demoted "..t.Name end
+
+Commands.give_all_tools=function(a) for _,p in ipairs(Players:GetPlayers())do if p.Backpack then for _,tool in ipairs(RS:GetChildren())do if tool:IsA("Tool")then tool:Clone().Parent=p.Backpack end end end end;return true,"All tools given!" end
+Commands.clear_all_tools=function(a) for _,p in ipairs(Players:GetPlayers())do if p.Backpack then p.Backpack:ClearAllChildren()end;if p.Character then for _,item in ipairs(p.Character:GetChildren())do if item:IsA("Tool")then item:Destroy()end end end end;return true,"All tools cleared!" end
+Commands.freeze_all_except_me=function(a) for _,p in ipairs(Players:GetPlayers())do if p~=a then Frozen[p.UserId]=true;local h=getHRP(p);if h then h.Anchored=true end;local hm=getHum(p);if hm then hm.WalkSpeed=0;hm.JumpPower=0 end end end;return true,"Froze all (not you)!" end
+Commands.kill_all_except_me=function(a) for _,p in ipairs(Players:GetPlayers())do if p~=a and not GodMode[p.UserId] then local h=getHum(p);if h then h.Health=0 end end end;return true,"Killed all (not you)!" end
+Commands.tp_all_to_me=function(a) local aH=getHRP(a);if not aH then return false,"No char" end;for _,p in ipairs(Players:GetPlayers())do if p~=a then local h=getHRP(p);if h then h.CFrame=aH.CFrame+Vector3.new(math.random(-8,8),0,math.random(-8,8))end end end;return true,"All to you!" end
+Commands.god_me=function(a) GodMode[a.UserId]=true;local h=getHum(a);if h then h.MaxHealth=math.huge;h.Health=math.huge end;notify(a,"✨ God ON!","success");return true,"God: you" end
+Commands.ungod_me=function(a) GodMode[a.UserId]=nil;local h=getHum(a);if h then h.MaxHealth=100;h.Health=100 end;return true,"Ungod: you" end
+Commands.invisible_me=function(a) Invisible[a.UserId]=true;local c=a.Character;if c then for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")then p.Transparency=1 end end end;notify(a,"👻 Invis ON","success");return true,"Invis: you" end
+Commands.visible_me=function(a) Invisible[a.UserId]=nil;local c=a.Character;if c then for _,p in ipairs(c:GetDescendants())do if p:IsA("BasePart")and p.Name~="HumanoidRootPart" then p.Transparency=0 end end end;return true,"Visible: you" end
+Commands.launch_me=function(a) local h=getHRP(a);if h then h.AssemblyLinearVelocity=Vector3.new(0,350,0)end;return true,"Launched: you" end
+Commands.explode_me=function(a) local h=getHRP(a);if h then blowUp(h.Position,12)end;return true,"Exploded: you" end
+
+-- Logs
+Commands.getlog = function(a, count)
+	local n = math.min(tonumber(count) or 20, #ActionLog)
+	local lines = {}
+	for i=1,n do
+		local e=ActionLog[i]
+		if e then lines[#lines+1]="["..e.time.."] "..e.admin.." → "..e.action..(e.target~="—" and " ("..e.target..")" or "") end
+	end
+	notify(a, "Last "..n.." actions:\n"..table.concat(lines,"\n"), "info")
+	return true,"Log sent"
+end
+
+Commands.clearlog = function(a)
+	ActionLog={}; return true,"Log cleared"
+end
+
+-- ── REPORT MANAGEMENT (admin side) ────────────────────────────────
+Commands.get_reports = function(a, status_filter)
+	local result={}
+	for _,r in ipairs(Reports) do
+		if not status_filter or status_filter=="" or r.status==status_filter then
+			table.insert(result, string.format("[#%d %s] %s reported %s: %s | %s",
+				r.id, r.status, r.reporterName, r.reportedName, r.reason, r.time))
+		end
+	end
+	if #result==0 then notify(a,"No reports found","info") else
+		for i=1,math.min(#result,10) do notify(a,result[i],"info") end
+	end
+	return true,"Sent "..#result.." report(s)"
+end
+
+Commands.dismiss_report = function(a, id)
+	local rid = tonumber(id)
+	for _,r in ipairs(Reports) do
+		if r.id==rid then r.status="DISMISSED"; logAction(a,"DISMISS REPORT #"..rid,r.reportedName); return true,"Report #"..rid.." dismissed" end
+	end
+	return false,"Report not found: "..tostring(id)
+end
+
+Commands.act_report = function(a, id, action)
+	local rid = tonumber(id)
+	for _,r in ipairs(Reports) do
+		if r.id==rid then
+			r.status="ACTIONED"
+			logAction(a,"ACT REPORT #"..rid.." → "..(action or "?"),r.reportedName)
+			-- Notify reporter
+			local reporter=Players:GetPlayerByUserId(r.reporterUid)
+			if reporter then notify(reporter,"✅ Your report about "..r.reportedName.." has been reviewed. Action taken: "..(action or "Reviewed"),"success")end
+			return true,"Report #"..rid.." actioned"
+		end
+	end
+	return false,"Report not found: "..tostring(id)
+end
+
+Commands.clear_reports = function(a)
+	Reports={}; logAction(a,"CLEAR REPORTS",""); return true,"All reports cleared"
+end
+
+-- ══════════════════════════════════════════════════════════════════
+--  HEARTBEAT: enforce frozen / cuffed / jailed / god / invisible
+-- ══════════════════════════════════════════════════════════════════
+RunSvc.Heartbeat:Connect(function()
+	-- Jailed players stay at (0,150,0)
+	for uid in pairs(Jailed) do
+		local p=Players:GetPlayerByUserId(uid)
+		local h=p and getHRP(p)
+		if h and (h.Position-Vector3.new(0,150,0)).Magnitude>22 then h.CFrame=CFrame.new(0,150,0) end
+	end
+	-- Cuffed players can't move
+	for uid in pairs(Cuffed) do
+		local p=Players:GetPlayerByUserId(uid)
+		local h=p and getHum(p)
+		if h then h.WalkSpeed=0;h.JumpPower=0 end
+	end
+	-- God mode players stay at full health
+	for uid in pairs(GodMode) do
+		local p=Players:GetPlayerByUserId(uid)
+		local h=p and getHum(p)
+		if h and h.MaxHealth~=math.huge then h.MaxHealth=math.huge end
+		if h and h.Health<h.MaxHealth then h.Health=h.MaxHealth end
+	end
+	-- Invisible players stay invisible on respawn
+	for uid in pairs(Invisible) do
+		local p=Players:GetPlayerByUserId(uid)
+		local c=p and p.Character
+		if c then
+			for _,pt in ipairs(c:GetDescendants()) do if pt:IsA("BasePart") then pt.Transparency=1 end end
+		end
+	end
+end)
+
+-- ══════════════════════════════════════════════════════════════════
+--  REPORT SYSTEM (player-facing)
+-- ══════════════════════════════════════════════════════════════════
+ReportEvent.OnServerEvent:Connect(function(reporter, reportedName, reason, category)
+	if not reporter or not reporter.Parent then return end
+
+	-- Validate reported player exists
+	local reportedPlayer = Players:FindFirstChild(reportedName)
+	local reportedUid = reportedPlayer and reportedPlayer.UserId or 0
+
+	-- Rate limit: max 3 reports per player per session
+	local reportCount = 0
+	for _,r in ipairs(Reports) do if r.reporterUid==reporter.UserId then reportCount=reportCount+1 end end
+	if reportCount >= 5 then
+		notify(reporter,"⚠ You have reached the report limit for this session","warning")
+		return
+	end
+
+	-- Duplicate check: same reporter + reported in last 5 mins
+	for _,r in ipairs(Reports) do
+		if r.reporterUid==reporter.UserId and r.reportedName==reportedName and tick()-r.rawTime<300 then
+			notify(reporter,"⚠ You already reported this player recently","warning")
+			return
+		end
+	end
+
+	reportCounter = reportCounter + 1
+	local report = {
+		id          = reportCounter,
+		reporterName= reporter.Name,
+		reporterUid = reporter.UserId,
+		reportedName= reportedName or "Unknown",
+		reportedUid = reportedUid,
+		reason      = (reason or "No reason"):sub(1,200),
+		category    = category or "General",
+		time        = os.date("%H:%M:%S"),
+		rawTime     = tick(),
+		status      = "PENDING"
+	}
+	table.insert(Reports, 1, report)
+	if #Reports > 100 then Reports[101]=nil end
+
+	-- Confirm to reporter
+	notify(reporter,"✅ Report #"..reportCounter.." submitted. Admins have been notified.","success")
+
+	-- Alert all online admins
+	notifyAdmins(
+		"📋 NEW REPORT #"..reportCounter.."\n"..reporter.Name.." reported "..reportedName..
+		"\nReason: "..(reason or "No reason").."\nCategory: "..(category or "General"),
+		"warning"
+	)
+
+	-- Fire to all admin clients (for Reports tab live update)
+	for _,p in ipairs(Players:GetPlayers()) do
+		if isAdmin(p) then
+			AdminNotif:FireClient(p, "REPORT_UPDATE", "report_new")
+		end
+	end
+
+	print("[PhantomAdmin] Report #"..reportCounter.." filed by "..reporter.Name.." against "..reportedName)
+end)
+
+-- Report query (for Reports tab to fetch all reports)
+ReportQuery.OnServerInvoke = function(player, queryType, data)
+	if not isAdmin(player) then return {success=false} end
+
+	if queryType == "getAll" then
+		return {success=true, reports=Reports}
+
+	elseif queryType == "dismiss" then
+		local rid = data and data.id
+		for _,r in ipairs(Reports) do
+			if r.id==rid then
+				r.status="DISMISSED"
+				logAction(player,"DISMISS REPORT #"..rid,r.reportedName)
+				-- Notify reporter if online
+				local rep=Players:GetPlayerByUserId(r.reporterUid)
+				if rep then notify(rep,"Your report #"..rid.." was reviewed by admin","info") end
+				return {success=true}
+			end
+		end
+		return {success=false, message="Report not found"}
+
+	elseif queryType == "action" then
+		local rid = data and data.id
+		local action = data and data.action
+		for _,r in ipairs(Reports) do
+			if r.id==rid then
+				r.status="ACTIONED"
+				r.actionTaken = action or "Reviewed"
+				logAction(player,"ACT REPORT #"..rid,r.reportedName)
+				-- Execute action if specified
+				local target=Players:GetPlayerByUserId(r.reportedUid)
+				if target and action then
+					if action=="kick" then
+						target:Kick("🚫 You were reported and an admin took action. Reason: "..r.reason)
+					elseif action=="warn" then
+						Commands.warn(player, target.Name, "Report #"..rid..": "..r.reason)
+					elseif action=="ban" then
+						Commands.ban(player, target.Name, "Report #"..rid..": "..r.reason)
+					elseif action=="mute" then
+						Muted[target.UserId]=true
+					end
+				end
+				-- Notify reporter
+				local rep=Players:GetPlayerByUserId(r.reporterUid)
+				if rep then notify(rep,"✅ Your report #"..rid.." has been actioned. Action: "..(action or "Reviewed"),"success") end
+				return {success=true}
+			end
+		end
+		return {success=false, message="Report not found"}
+
+	elseif queryType == "clear" then
+		Reports={}; logAction(player,"CLEAR ALL REPORTS","")
+		return {success=true}
+	end
+	return {success=false}
+end
+
+-- ══════════════════════════════════════════════════════════════════
+--  COMMAND HANDLER
+-- ══════════════════════════════════════════════════════════════════
+AdminCmd.OnServerEvent:Connect(function(player, cmdName, ...)
+	if not isAdmin(player) then
+		notify(player,"❌ You are not an admin!","error"); return
+	end
+
+	local cmd = Commands[tostring(cmdName):lower()]
+	if cmd then
+		local ok, result, msg = pcall(cmd, player, ...)
+		if ok then
+			if result then
+				notify(player,"✅ "..(msg or cmdName),"success")
+			else
+				notify(player,"⚠ "..(msg or "Command failed"),"error")
+			end
+		else
+			warn("[PhantomAdmin] Error in '"..cmdName.."': "..tostring(result))
+			notify(player,"❌ Error: "..tostring(result):sub(1,80),"error")
+		end
+	else
+		notify(player,"❓ Unknown command: "..tostring(cmdName),"error")
+	end
+end)
+
+-- ══════════════════════════════════════════════════════════════════
+--  GLOBAL PLAYER SEARCH (searches entire game, not just this server)
+-- ══════════════════════════════════════════════════════════════════
+SearchQuery.OnServerInvoke = function(player, query)
+	if not isAdmin(player) then return {success=false, results={}} end
+	if not query or #query < 2 then return {success=false, results={}} end
+
+	local results = {}
+	local lo = query:lower()
+
+	-- First search current server players (fast)
+	for _, p in ipairs(Players:GetPlayers()) do
+		local pn = p.Name:lower()
+		local dn = p.DisplayName:lower()
+		if pn:find(lo,1,true) or dn:find(lo,1,true) then
+			table.insert(results, {
+				Name        = p.Name,
+				DisplayName = p.DisplayName,
+				UserId      = p.UserId,
+				InServer    = true,
+				HP          = 0, WalkSpeed = 0,
+			})
+			-- Fill HP/speed
+			local h=getHum(p)
+			if h then results[#results].HP=math.floor(h.Health); results[#results].WalkSpeed=math.floor(h.WalkSpeed) end
+		end
+	end
+
+	-- Then try global search via Players:GetUserIdFromNameAsync for exact names
+	-- and Players:GetPlayerByUserId for ID searches
+	local alreadyFound = {}
+	for _,r in ipairs(results) do alreadyFound[r.Name]=true end
+
+	-- If query looks like a number, search by UserId
+	local uid = tonumber(query)
+	if uid then
+		local ok, info = pcall(function()
+			return Players:GetNameFromUserIdAsync(uid)
+		end)
+		if ok and info and not alreadyFound[info] then
+			local ok2, avId = pcall(function()
+				return Players:GetUserIdFromNameAsync(info)
+			end)
+			table.insert(results, {
+				Name        = info,
+				DisplayName = info,
+				UserId      = uid,
+				InServer    = false,
+				HP=0, WalkSpeed=0
+			})
+		end
+	end
+
+	-- Try exact username lookup
+	local ok, foundId = pcall(function()
+		return Players:GetUserIdFromNameAsync(query)
+	end)
+	if ok and foundId and not alreadyFound[query] then
+		local ok2, foundName = pcall(function()
+			return Players:GetNameFromUserIdAsync(foundId)
+		end)
+		if ok2 and foundName and not alreadyFound[foundName] then
+			table.insert(results, {
+				Name        = foundName,
+				DisplayName = foundName,
+				UserId      = foundId,
+				InServer    = false,
+				HP=0, WalkSpeed=0
+			})
+		end
+	end
+
+	return {success=true, results=results, query=query}
+end
+AdminQuery.OnServerInvoke = function(player, queryType)
+	local ok, res = pcall(function()
+		if queryType == "isAdmin" then
+			return {isAdmin=isAdmin(player), isOwner=isOwner(player), success=true}
+		elseif queryType == "getPlayers" then
+			local list={}
+			for _,p in ipairs(Players:GetPlayers()) do
+				local h = getHum(p)
+				list[#list+1]={
+					Name=p.Name, DisplayName=p.DisplayName, UserId=p.UserId,
+					isAdmin=isAdmin(p),
+					HP=h and math.floor(h.Health) or 0,
+					MaxHP=h and math.floor(h.MaxHealth) or 0,
+					WalkSpeed=h and math.floor(h.WalkSpeed) or 0,
+					Ping=0,
+					isFrozen=Frozen[p.UserId] or false,
+					isGod=GodMode[p.UserId] or false,
+					isMuted=Muted[p.UserId] or false,
+					isJailed=Jailed[p.UserId] or false,
+					strikeCount=Strikes[p.UserId] or 0,
+					warnCount=Warnings[p.UserId] and #Warnings[p.UserId] or 0,
+				}
+			end
+			return {success=true, players=list}
+		end
+		return {success=false}
+	end)
+	if ok then return res end
+	warn("[PhantomAdmin] Query error: "..tostring(res))
+	return {isAdmin=false, success=false}
+end
+
+-- ══════════════════════════════════════════════════════════════════
+--  PLAYER EVENTS
+-- ══════════════════════════════════════════════════════════════════
+Players.PlayerAdded:Connect(function(player)
+	-- Ban check
+	local ban = Banned[player.UserId]
+	if ban then
+		if type(ban)=="table" and ban.expiry and tick()<ban.expiry then
+			player:Kick("⏱ You are temp banned. "..math.ceil(ban.expiry-tick()).."s remaining.")
+			return
+		elseif type(ban)=="boolean" and ban then
+			player:Kick("☠ You are permanently banned from this server.")
+			return
+		elseif type(ban)=="table" then
+			Banned[player.UserId]=nil -- expired
+		end
+	end
+	-- Server lock
+	if serverLocked and not isAdmin(player) then
+		player:Kick("🔒 This server is currently locked. Admins only.")
+		return
+	end
+
+	-- Chat monitoring
+	player.Chatted:Connect(function(msg)
+		if chatLocked and not isAdmin(player) then
+			return -- can't stop chat server-side but log it
+		end
+		if Muted[player.UserId] then
+			warn("[PhantomAdmin] MUTED player "..player.Name.." said: "..msg)
+		end
+	end)
+
+	notifyAdmins("📢 "..player.Name.." ("..player.UserId..") joined the game","info")
+	logAction({Name="System"},"JOIN",player.Name)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	logAction({Name="System"},"LEAVE",player.Name)
+	notifyAdmins("📢 "..player.Name.." left the game","info")
+end)
+
+-- ══════════════════════════════════════════════════════════════════
+--  EVENT SYSTEM — FULLY SCRIPTED (no models needed for built-in events)
+-- ══════════════════════════════════════════════════════════════════
+local EventModels = RS:FindFirstChild("Event") -- optional folder for Taco/DJ/Barrier/Blackhole models
+
+local function evStop(name, sound, cleanup)
+	if not activeEvts[name] then return end
+	pcall(function() if cleanup then cleanup() end end)
+	if sound and sound.Parent then pcall(function() sound:Stop(); sound:Destroy() end) end
+	local anyOther=false
+	for n,v in pairs(activeEvts) do if n~=name and v then anyOther=true;break end end
+	if not anyOther then resetLighting() end
+	EventUpdate:FireAllClients("STOP",{name=name})
+	activeEvts[name]=nil
+	local endSnd=Instance.new("Sound",WS);endSnd.SoundId="rbxassetid://2048662066";endSnd.Volume=8;endSnd:Play()
+	Debris:AddItem(endSnd,5)
+end
+
+local function mkSnd(id, loop, vol)
+	if not id or id=="" then return nil end
+	local s=Instance.new("Sound",WS)
+	s.SoundId=id; s.Looped=loop~=false; s.Volume=vol or 1
+	s.RollOffMaxDistance=10000
+	pcall(function() s:Play() end)
+	return s
+end
+
+-- ── SCRIPTED FLOOD EVENT (real rising water part) ─────────────────
+local function runFloodEvent(duration)
+	local evtName = "Flood"
+	if activeEvts[evtName] then return end
+	activeEvts[evtName] = true
+	EventUpdate:FireAllClients("INTRO",{message="🌊 THE FLOOD IS RISING!"})
+	EventUpdate:FireAllClients("START",{name=evtName,duration=duration,icon="rbxassetid://14293766276"})
+	local s = mkSnd("rbxassetid://9114492495")
+
+	-- Create water part at ground level
+	local water = Instance.new("Part", WS)
+	water.Name = "PA_FloodWater"
+	water.Size = Vector3.new(4000, 1, 4000)
+	water.Position = Vector3.new(0, -50, 0)  -- start below ground
+	water.Anchored = true
+	water.CanCollide = true
+	water.Material = Enum.Material.Water
+	water.BrickColor = BrickColor.new("Cyan")
+	water.Transparency = 0.35
+	water.TopSurface = Enum.SurfaceType.Smooth
+	water.BottomSurface = Enum.SurfaceType.Smooth
+	water.CastShadow = false
+
+	-- Fog for atmosphere
+	local origFogEnd2 = Lighting.FogEnd
+	Lighting.FogEnd = 300
+	Lighting.FogColor = Color3.fromRGB(30, 90, 150)
+	tweenLight({Brightness=0.8, Ambient=Color3.fromRGB(20,60,120), ClockTime=8},3)
+
+	-- Rise up over time
+	local targetY = 35  -- how high water rises
+	local riseTime = 20 -- seconds to reach peak
+	local stayTime = duration - riseTime - 10
+	local fallTime = 10
+
+	-- Rise phase
+	TweenSvc:Create(water, TweenInfo.new(riseTime, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+		{Position=Vector3.new(0, targetY, 0)}):Play()
+
+	-- Wave effect (runs while event is active)
+	local waveConn; local waveTime=0
+	waveConn = RunSvc.Heartbeat:Connect(function(dt)
+		waveTime = waveTime + dt
+		if not activeEvts[evtName] then waveConn:Disconnect(); return end
+		if water.Parent then
+			water.Size = Vector3.new(4000, 1 + math.sin(waveTime*1.5)*0.8, 4000)
+		end
+	end)
+
+	-- Damage players underwater
+	local dmgConn; dmgConn = RunSvc.Heartbeat:Connect(function()
+		if not activeEvts[evtName] then dmgConn:Disconnect(); return end
+		for _,p in ipairs(Players:GetPlayers()) do
+			local hrp = getHRP(p)
+			if hrp and hrp.Position.Y < water.Position.Y + 2 then
+				local h = getHum(p)
+				if h and not GodMode[p.UserId] then h:TakeDamage(3) end
+			end
+		end
+	end)
+
+	-- After duration: drain water
+	task.delay(duration - fallTime, function()
+		if not water.Parent then return end
+		TweenSvc:Create(water, TweenInfo.new(fallTime, Enum.EasingStyle.Sine),
+			{Position=Vector3.new(0,-60,0)}):Play()
+	end)
+
+	task.delay(duration, function()
+		waveConn:Disconnect(); dmgConn:Disconnect()
+		evStop(evtName, s, function()
+			if water.Parent then water:Destroy() end
+			Lighting.FogEnd = origFogEnd2
+			Lighting.FogColor = origLight.FogColor
+		end)
+	end)
+end
+
+-- ── SCRIPTED BLOOD MOON EVENT (atmospheric + blood rain) ──────────
+local function runBloodEvent(duration)
+	local evtName = "Blood"
+	if activeEvts[evtName] then return end
+	activeEvts[evtName] = true
+	EventUpdate:FireAllClients("INTRO",{message="🩸 THE BLOOD MOON HAS RISEN..."})
+	EventUpdate:FireAllClients("START",{name=evtName,duration=duration,icon="rbxassetid://14293766276"})
+	local s = mkSnd("rbxassetid://9048216058")
+
+	-- Atmospheric changes
+	TweenSvc:Create(Lighting, TweenInfo.new(4, Enum.EasingStyle.Sine),{
+		ClockTime=0, Brightness=0.2, Ambient=Color3.fromRGB(110,0,0)
+	}):Play()
+	Lighting.FogEnd = 180
+	Lighting.FogColor = Color3.fromRGB(90, 0, 0)
+	Lighting.FogStart = 0
+
+	-- Red sky (colorshift)
+	local origTop = Lighting.ColorShift_Top
+	local origBot = Lighting.ColorShift_Bottom
+	TweenSvc:Create(Lighting, TweenInfo.new(3),{
+		ColorShift_Top = Color3.fromRGB(150,0,0),
+		ColorShift_Bottom = Color3.fromRGB(80,0,0)
+	}):Play()
+
+	-- Blood droplets raining down
+	local bloodFolder = Instance.new("Folder", WS); bloodFolder.Name = "PA_BloodRain"
+	local rainConn; local rainLast = tick()
+	rainConn = RunSvc.Heartbeat:Connect(function()
+		if not activeEvts[evtName] then rainConn:Disconnect(); return end
+		if tick()-rainLast >= 0.08 then
+			rainLast = tick()
+			-- Create blood droplet
+			local drop = Instance.new("Part", bloodFolder)
+			drop.Size = Vector3.new(0.15, 0.6, 0.15)
+			drop.Shape = Enum.PartType.Block
+			drop.BrickColor = BrickColor.new("Bright red")
+			drop.Material = Enum.Material.SmoothPlastic
+			drop.CanCollide = false
+			drop.CastShadow = false
+			drop.CFrame = CFrame.new(math.random(-120,120), 80, math.random(-120,120))
+			drop.AssemblyLinearVelocity = Vector3.new(
+				math.random(-3,3), -55+math.random(-5,5), math.random(-3,3)
+			)
+			-- Splatter on touch
+			drop.Touched:Connect(function(hit)
+				if not drop.Parent then return end
+				if hit:IsA("Terrain") or (hit.Anchored and hit.Name ~= "PA_BloodRain") then
+					-- Leave blood splat decal on floor parts
+					local splat = Instance.new("Part", WS)
+					splat.Size = Vector3.new(math.random(1,3)*0.5, 0.05, math.random(1,3)*0.5)
+					splat.Anchored = true; splat.CanCollide = false; splat.CastShadow = false
+					splat.BrickColor = BrickColor.new("Dark red"); splat.Material = Enum.Material.SmoothPlastic
+					splat.CFrame = CFrame.new(drop.Position.X, drop.Position.Y, drop.Position.Z)
+					Debris:AddItem(splat, 20)
+					drop:Destroy()
+				end
+			end)
+			-- Damage players hit by blood
+			drop.Touched:Connect(function(hit)
+				if not drop.Parent then return end
+				local hm = hit.Parent and hit.Parent:FindFirstChildOfClass("Humanoid")
+				if hm and not GodMode[(hit.Parent.Parent and hit.Parent.Parent:IsA("Player") and hit.Parent.Parent.UserId) or 0] then
+					hm:TakeDamage(2)
+				end
+			end)
+			Debris:AddItem(drop, 5)
+		end
+	end)
+
+	-- Periodic dramatic messages
+	for i = 1, 3 do
+		task.delay(duration/4 * i, function()
+			if activeEvts[evtName] then
+				local msgs = {"🩸 The blood rains from above...","👁 Something watches from the darkness...","💀 No one is safe under the Blood Moon..."}
+				announce(msgs[i], Color3.fromRGB(180,0,0), 4)
+			end
+		end)
+	end
+
+	task.delay(duration, function()
+		rainConn:Disconnect()
+		-- Restore sky color
+		TweenSvc:Create(Lighting, TweenInfo.new(4),{
+			ColorShift_Top = origTop, ColorShift_Bottom = origBot
+		}):Play()
+		evStop(evtName, s, function()
+			if bloodFolder.Parent then bloodFolder:Destroy() end
+			Lighting.FogEnd = origLight.FogEnd
+			Lighting.FogColor = origLight.FogColor
+			Lighting.FogStart = origLight.FogStart
+		end)
+	end)
+end
+
+-- ── SCRIPTED METEOR SHOWER (real physics meteors with craters) ─────
+local function runMeteorEvent(duration)
+	local evtName = "MeteorShower"
+	if activeEvts[evtName] then return end
+	activeEvts[evtName] = true
+	EventUpdate:FireAllClients("INTRO",{message="☄ METEOR SHOWER INCOMING — TAKE COVER!"})
+	EventUpdate:FireAllClients("START",{name=evtName,duration=duration,icon="rbxassetid://15909632816"})
+	local s = mkSnd("rbxassetid://1840422987")
+
+	tweenLight({Brightness=0.6, Ambient=Color3.fromRGB(80,40,0), ClockTime=0},3)
+
+	-- Spawn region check
+	local spawnRegion = WS:FindFirstChild("MeteorSpawnRegion")
+	local minX, maxX, minZ, maxZ, spawnY = -150, 150, -150, 150, 150
+	if spawnRegion and spawnRegion:IsA("BasePart") then
+		local sz=spawnRegion.Size; local pos=spawnRegion.Position
+		minX=pos.X-sz.X/2; maxX=pos.X+sz.X/2
+		minZ=pos.Z-sz.Z/2; maxZ=pos.Z+sz.Z/2
+		spawnY=pos.Y+sz.Y/2+20
+	end
+
+	local meteorFolder = Instance.new("Folder", WS); meteorFolder.Name = "PA_MeteorShower"
+	local mConn; local mLast = tick()
+	-- Interval gets faster as event progresses
+	local startInterval = 0.6
+	local endInterval   = 0.08
+
+	mConn = RunSvc.Heartbeat:Connect(function()
+		if not activeEvts[evtName] then mConn:Disconnect(); return end
+		local progress = math.clamp((tick() - (tick() - duration)) / duration, 0, 1)
+		local interval = startInterval - (startInterval - endInterval) * progress
+
+		if tick() - mLast >= interval then
+			mLast = tick()
+
+			-- Create meteor
+			local size = math.random(2, 6) * 0.5 + 1
+			local m = Instance.new("Part", meteorFolder)
+			m.Name = "Meteor"
+			m.Size = Vector3.new(size, size, size)
+			m.Shape = Enum.PartType.Ball
+			m.Material = Enum.Material.Rock
+			m.BrickColor = BrickColor.new("Dark orange")
+			m.CastShadow = false
+
+			-- Random spawn position
+			local spawnX = math.random(minX, maxX)
+			local spawnZ = math.random(minZ, maxZ)
+			m.CFrame = CFrame.new(spawnX, spawnY + math.random(0,30), spawnZ)
+
+			-- Velocity: angled fall
+			local angle = math.random(-25, 25)
+			m.AssemblyLinearVelocity = Vector3.new(
+				math.random(-20,20), -90 + math.random(-15, 15), math.random(-20,20)
+			)
+
+			-- Spin while falling
+			local spinBav = Instance.new("BodyAngularVelocity", m)
+			spinBav.AngularVelocity = Vector3.new(math.random(-8,8), math.random(-5,5), math.random(-8,8))
+			spinBav.MaxTorque = Vector3.new(1e5,1e5,1e5)
+
+			-- Glowing fire trail
+			local a0 = Instance.new("Attachment", m); a0.Position = Vector3.new(0,0,0)
+			local a1 = Instance.new("Attachment", m); a1.Position = Vector3.new(0, size*0.6, 0)
+			local trail = Instance.new("Trail", m)
+			trail.Attachment0=a0; trail.Attachment1=a1
+			trail.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255,200,50)),
+				ColorSequenceKeypoint.new(0.4, Color3.fromRGB(255,80,0)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(80,20,0)),
+			})
+			trail.Transparency = NumberSequence.new(0, 0.8)
+			trail.Lifetime = 0.7
+			trail.MinLength = 0
+
+			-- Glow on meteor
+			local pl = Instance.new("PointLight", m)
+			pl.Brightness = 6; pl.Range = 20
+			pl.Color = Color3.fromRGB(255,150,50)
+
+			-- Smoke puff
+			local smk = Instance.new("Smoke", m)
+			smk.Color = Color3.fromRGB(80,60,50); smk.RiseVelocity = 5; smk.Opacity = 0.3
+
+			-- Impact logic
+			local impacted = false
+			m.Touched:Connect(function(hit)
+				if impacted then return end
+				if not m.Parent then return end
+				-- Don't trigger on other meteors
+				if hit:IsA("Part") and hit.Parent == meteorFolder then return end
+
+				impacted = true
+
+				local impactPos = m.Position
+
+				-- Damage nearby players
+				for _, p in ipairs(Players:GetPlayers()) do
+					local hrp = getHRP(p)
+					if hrp then
+						local dist = (hrp.Position - impactPos).Magnitude
+						if dist < 15 then
+							local dmg = math.floor(50 * (1 - dist/15))
+							local h = getHum(p)
+							if h and not GodMode[p.UserId] then h:TakeDamage(dmg) end
+						end
+					end
+				end
+
+				-- Explosion effect
+				local exp = Instance.new("Explosion", WS)
+				exp.Position = impactPos
+				exp.BlastRadius = size * 3.5
+				exp.BlastPressure = 300000
+				exp.DestroyJointRadiusPercent = 0
+
+				-- Crater: scorch mark on floor
+				local crater = Instance.new("Part", WS)
+				crater.Size = Vector3.new(size*3, 0.3, size*3)
+				crater.Shape = Enum.PartType.Cylinder
+				crater.Anchored = true; crater.CanCollide = false; crater.CastShadow = false
+				crater.BrickColor = BrickColor.new("Really black")
+				crater.Material = Enum.Material.SmoothPlastic
+				crater.CFrame = CFrame.new(impactPos.X, impactPos.Y-size/2+0.2, impactPos.Z)
+					* CFrame.Angles(0,0,math.pi/2)
+				crater.Transparency = 0.1
+				Debris:AddItem(crater, 60)
+
+				-- Debris chunks flying out
+				for i = 1, math.random(4,8) do
+					local chunk = Instance.new("Part", WS)
+					chunk.Size = Vector3.new(math.random(1,3)*0.3, math.random(1,3)*0.3, math.random(1,3)*0.3)
+					chunk.Material = Enum.Material.Rock
+					chunk.BrickColor = BrickColor.new("Dark orange")
+					chunk.CFrame = CFrame.new(impactPos)
+					chunk.AssemblyLinearVelocity = Vector3.new(
+						math.random(-30,30), math.random(15,40), math.random(-30,30)
+					)
+					Debris:AddItem(chunk, 8)
+				end
+
+				m:Destroy()
+			end)
+			Debris:AddItem(m, 12)
+		end
+	end)
+
+	task.delay(duration, function()
+		mConn:Disconnect()
+		for _,c in ipairs(meteorFolder:GetChildren()) do c:Destroy() end
+		meteorFolder:Destroy()
+		evStop(evtName, s, nil)
+	end)
+end
+
+TriggerEvent.OnServerEvent:Connect(function(player, mode, evtName, message)
+	if not isAdmin(player) then return end
+	local pName = player.DisplayName or player.Name
+
+	-- Announcement
+	if message and message ~= "" then
+		EventUpdate:FireAllClients("MESSAGE","",message,pName)
+		if mode=="GLOBAL" then
+			pcall(function()
+				game:GetService("MessagingService"):PublishAsync("PA_ANN",{msg=message,by=pName})
+			end)
+		end
+	end
+
+	if not evtName then return end
+
+	-- Route fully-scripted events (no model needed)
+	if evtName == "Flood" then
+		runFloodEvent(46); return
+	elseif evtName == "Blood" then
+		runBloodEvent(60); return
+	elseif evtName == "MeteorShower" then
+		runMeteorEvent(30); return
+	end
+
+	-- Model-based events need the Event folder
+	if not EventModels then
+		notify(player,"⚠ Event folder 'Event' not found in ReplicatedStorage. Add models for Taco/DJ/Blackhole/Barrier.","warning")
+		return
+	end
+	local model = EventModels:FindFirstChild(evtName)
+	if not model then
+		notify(player,"⚠ Event model '"..evtName.."' not found in Event folder","warning"); return
+	end
+	if activeEvts[evtName] then notify(player,"⚠ "..evtName.." is already active!","warning"); return end
+
+	local EVTINFO = {
+		Taco        ={Time=92, Sound="rbxassetid://142376088",   Icon="rbxassetid://12895487741"},
+		Blackhole   ={Time=120,Sound="rbxassetid://9048216058",  Icon="rbxassetid://91591398851116",Force=1000},
+		Barrier     ={Time=120,Sound="rbxassetid://112379884174656",Icon="rbxassetid://14133069691"},
+		DJ          ={Time=120,Sound="rbxassetid://95158960995959",Icon="rbxassetid://12984480615"},
+	}
+	local info = EVTINFO[evtName] or {Time=60,Sound="",Icon=""}
+
+	activeEvts[evtName]=true
+	local evModel=model:Clone(); evModel.Parent=WS
+	local s=mkSnd(info.Sound)
+	EventUpdate:FireAllClients("START",{name=evtName,duration=info.Time,icon=info.Icon or ""})
+	logAction(player,"EVENT: "..evtName,"server")
+
+	if evtName=="Taco" then
+		tweenLight({Brightness=0.5,Ambient=Color3.fromRGB(150,0,255),ClockTime=0},2)
+		for _,p in ipairs(evModel:GetDescendants())do if p:IsA("ParticleEmitter")then p.Enabled=true end end
+	elseif evtName=="Blackhole" then
+		tweenLight({ClockTime=0,Brightness=0.2},20)
+		local center=evModel:GetPrimaryPartCFrame().Position
+		local bconn; bconn=RunSvc.Heartbeat:Connect(function()
+			if not activeEvts[evtName] then bconn:Disconnect();return end
+			for _,p in ipairs(Players:GetPlayers())do
+				local h=getHRP(p);if h then
+					local dir=center-h.Position;local d=dir.Magnitude
+					if d>2 then h:ApplyImpulse(dir.Unit*(info.Force/(d^2))*h.AssemblyMass*0.05)end
+				end
+			end
+		end)
+	elseif evtName=="DJ" then
+		tweenLight({Brightness=0.5,Ambient=Color3.fromRGB(150,0,255),ClockTime=0},2)
+		if s then s.Volume=2 end
+		EventUpdate:FireAllClients("INTRO",{message="🎧 Are you ready to PARTY?!"})
+	end
+
+	task.delay(info.Time, function()
+		evStop(evtName, s, function()
+			if evModel.Parent then evModel:Destroy() end
+		end)
+	end)
+
+	if mode=="GLOBAL" then
+		pcall(function()
+			game:GetService("MessagingService"):PublishAsync("PA_EVT",{name=evtName,by=pName})
+		end)
+	end
+end)
+	if not isAdmin(player) then return end
+	local pName = player.DisplayName or player.Name
+
+	-- Announcement
+	if message and message ~= "" then
+		EventUpdate:FireAllClients("MESSAGE","",message,pName)
+		if mode=="GLOBAL" then
+			pcall(function()
+				game:GetService("MessagingService"):PublishAsync("PA_ANN",{msg=message,by=pName})
+			end)
+		end
+	end
+
+	-- Event
+	if not evtName or not EventModels then return end
+	local model = EventModels:FindFirstChild(evtName)
+	if not model then
+		notify(player,"⚠ Event model '"..evtName.."' not found in Event folder","warning"); return
+	end
+	if activeEvts[evtName] then notify(player,"⚠ "..evtName.." is already active!","warning"); return end
+
+	local EVTINFO = {
+		Taco        ={Time=92, Sound="rbxassetid://142376088",   Icon="rbxassetid://12895487741"},
+		Flood       ={Time=46, Sound="rbxassetid://9114492495",  Icon="rbxassetid://14293766276"},
+		Blackhole   ={Time=120,Sound="rbxassetid://9048216058",  Icon="rbxassetid://91591398851116",Force=1000},
+		Barrier     ={Time=120,Sound="rbxassetid://112379884174656",Icon="rbxassetid://14133069691"},
+		DJ          ={Time=120,Sound="rbxassetid://95158960995959",Icon="rbxassetid://12984480615"},
+		MeteorShower={Time=30, Sound="rbxassetid://1840422987",  Icon="rbxassetid://15909632816"},
+		Blood       ={Time=60, Sound="rbxassetid://9048216058",  Icon="rbxassetid://14293766276"},
+	}
+	local info = EVTINFO[evtName] or {Time=60,Sound="",Icon=""}
+
+	activeEvts[evtName]=true
+	local evModel=model:Clone(); evModel.Parent=WS
+	local s=mkSnd(info.Sound)
+
+	EventUpdate:FireAllClients("START",{name=evtName,duration=info.Time,icon=info.Icon or ""})
+	logAction(player,"EVENT: "..evtName,"server")
+
+	-- Special per-event logic
+	if evtName=="Taco" then
+		tweenLight({Brightness=0.5,Ambient=Color3.fromRGB(150,0,255),ClockTime=0},2)
+		for _,p in ipairs(evModel:GetDescendants())do if p:IsA("ParticleEmitter")then p.Enabled=true end end
+
+	elseif evtName=="Blackhole" then
+		tweenLight({ClockTime=0,Brightness=0.2},20)
+		local center=evModel:GetPrimaryPartCFrame().Position
+		local bconn; bconn=RunSvc.Heartbeat:Connect(function()
+			if not activeEvts[evtName] then bconn:Disconnect();return end
+			for _,p in ipairs(Players:GetPlayers())do
+				local h=getHRP(p);if h then
+					local dir=center-h.Position;local d=dir.Magnitude
+					if d>2 then h:ApplyImpulse(dir.Unit*(info.Force/(d^2))*h.AssemblyMass*0.05)end
+				end
+			end
+		end)
+
+	elseif evtName=="DJ" then
+		tweenLight({Brightness=0.5,Ambient=Color3.fromRGB(150,0,255),ClockTime=0},2)
+		if s then s.Volume=2 end
+		EventUpdate:FireAllClients("INTRO",{message="🎧 Are you ready to PARTY?!"})
+
+	elseif evtName=="Flood" then
+		local water=evModel:FindFirstChild("Water")
+		if water then
+			local base=water.Position; local fconn
+			fconn=RunSvc.Heartbeat:Connect(function()
+				if not activeEvts[evtName] then fconn:Disconnect();return end
+				water.Position=base+Vector3.new(0,math.sin(tick()*2)*0.5,0)
+			end)
+		end
+
+	elseif evtName=="MeteorShower" then
+		EventUpdate:FireAllClients("INTRO",{message="☄ Meteors Incoming!"})
+		local folder=Instance.new("Folder",WS);folder.Name="PA_Meteors_"..evtName
+		local last=tick();local mconn
+		mconn=RunSvc.Heartbeat:Connect(function()
+			if not activeEvts[evtName] then mconn:Disconnect();folder:Destroy();return end
+			if tick()-last>=0.15 then last=tick()
+				local m=Instance.new("Part",folder);m.Size=Vector3.new(2.5,2.5,2.5)
+				m.Shape=Enum.PartType.Ball;m.BrickColor=BrickColor.new("Bright red");m.Material=Enum.Material.Neon
+				m.CFrame=CFrame.new(math.random(-120,120),130,math.random(-120,120))
+				m.AssemblyLinearVelocity=Vector3.new(math.random(-15,15),-95,math.random(-15,15))
+				local a0=Instance.new("Attachment",m);local a1=Instance.new("Attachment",m);a1.Position=Vector3.new(0,-2,0)
+				local tr=Instance.new("Trail",m);tr.Attachment0=a0;tr.Attachment1=a1
+				tr.Color=ColorSequence.new(Color3.fromRGB(255,120,0),Color3.fromRGB(255,60,0));tr.Lifetime=0.5
+				m.Touched:Connect(function(hit)
+					if not m.Parent then return end
+					local hm=hit.Parent and hit.Parent:FindFirstChildOfClass("Humanoid")
+					if hm then hm:TakeDamage(35)end;blowUp(m.Position,10,0);m:Destroy()
+				end)
+				Debris:AddItem(m,9)
+			end
+		end)
+
+	elseif evtName=="Blood" then
+		tweenLight({ClockTime=0,Brightness=0.3,Ambient=Color3.fromRGB(100,0,0)},2)
+		Lighting.FogEnd=200;Lighting.FogColor=Color3.fromRGB(80,0,0)
+		EventUpdate:FireAllClients("INTRO",{message="🩸 The Blood Moon rises..."})
+	end
+
+	task.delay(info.Time, function()
+		evStop(evtName, s, function()
+			if evModel.Parent then evModel:Destroy() end
+			if evtName=="Blood" then Lighting.FogEnd=100000 end
+		end)
+	end)
+
+	if mode=="GLOBAL" then
+		pcall(function()
+			game:GetService("MessagingService"):PublishAsync("PA_EVT",{name=evtName,by=pName})
+		end)
+	end
+end)
+
+pcall(function()
+	local MS=game:GetService("MessagingService")
+	MS:SubscribeAsync("PA_EVT",function(msg)
+		local d=msg.Data; if d and d.name then
+			-- Cross-server event mirror handled above per-server
+		end
+	end)
+	MS:SubscribeAsync("PA_ANN",function(msg)
+		local d=msg.Data
+		if d then EventUpdate:FireAllClients("MESSAGE","",d.msg or "",d.by or "Admin") end
+	end)
+end)
+
+-- ══════════════════════════════════════════════════════════════════
+--  STARTUP
+-- ══════════════════════════════════════════════════════════════════
+local n=0; for _ in pairs(Commands) do n=n+1 end
+
+print("╔══════════════════════════════════════════════════════════╗")
+print("║  A.APK.PANEL SERVER v11 ✅  LOADED                      ║")
+print("║  Owner: Kshusha319 (6136351097)                         ║")
+print("║  Commands: "..n.."  |  Global Search: ACTIVE                 ║")
+print("║  Flood: SCRIPTED WATER  |  Blood: SCRIPTED RAIN          ║")
+print("║  Meteors: PHYSICS + CRATERS  |  AdminFlex: YOUR NAME    ║")
+pr
