@@ -1,0 +1,256 @@
+-- ╔══════════════════════════════════════════════════════════════════╗
+-- ║  A.APK.PANEL — KEY SYSTEM SERVER  v1                            ║
+-- ║  Place in: ServerScriptService → Script                         ║
+-- ║  Works alongside AAPK_SERVER_v11_FINAL                          ║
+-- ╚══════════════════════════════════════════════════════════════════╝
+
+local Players  = game:GetService("Players")
+local RS       = game:GetService("ReplicatedStorage")
+local Debris   = game:GetService("Debris")
+
+-- ══════════════════════════════════════════════════════════════════
+--  OWNER CONFIG
+-- ══════════════════════════════════════════════════════════════════
+local OWNER_IDS  = {6136351097} -- Kshusha319
+local OWNER_USER = "kksshhusha$$$"
+local OWNER_KEY  = "kshusha#!("
+
+-- ══════════════════════════════════════════════════════════════════
+--  VALID KEYS TABLE
+--  Paste your exported Lua table from the website here.
+--  All comparisons are case-insensitive.
+--
+--  Example:
+--  { username="silverwolf482", key="ABCD-EFGH-IJKL", tier="Admin" },
+-- ══════════════════════════════════════════════════════════════════
+local VALID_KEYS = {
+	-- PASTE GENERATED KEYS HERE --
+}
+
+-- ══════════════════════════════════════════════════════════════════
+--  STATE
+-- ══════════════════════════════════════════════════════════════════
+local UsedSessions  = {} -- [userId] = tier  (stays authed for the session)
+local CurseWarnings = {} -- [userId] = count
+
+-- ══════════════════════════════════════════════════════════════════
+--  REMOTES — reuse PhantomAdminRemotes folder
+-- ══════════════════════════════════════════════════════════════════
+task.wait(1.5) -- wait for main server script to create the folder
+
+local AdminFolder = RS:FindFirstChild("PhantomAdminRemotes")
+if not AdminFolder then
+	AdminFolder = Instance.new("Folder", RS)
+	AdminFolder.Name = "PhantomAdminRemotes"
+end
+
+local function getOrCreate(par, class, name)
+	return par:FindFirstChild(name) or (function()
+		local o = Instance.new(class, par); o.Name = name; return o
+	end)()
+end
+
+local AdminNotif  = getOrCreate(AdminFolder, "RemoteEvent",    "AdminNotification")
+local ValidateKey = getOrCreate(AdminFolder, "RemoteFunction", "ValidateKey")
+
+-- ══════════════════════════════════════════════════════════════════
+--  HELPERS
+-- ══════════════════════════════════════════════════════════════════
+local function isOwner(p)
+	for _, id in ipairs(OWNER_IDS) do if p.UserId == id then return true end end
+	return false
+end
+
+local function notify(p, msg, t)
+	pcall(function() AdminNotif:FireClient(p, msg, t or "info") end)
+end
+
+local function notifyOwners(msg)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if isOwner(p) then notify(p, msg, "warning") end
+	end
+end
+
+-- ══════════════════════════════════════════════════════════════════
+--  KEY VALIDATION
+-- ══════════════════════════════════════════════════════════════════
+ValidateKey.OnServerInvoke = function(player, inputUser, inputKey)
+	if not player or not player.Parent then
+		return {success=false, reason="Error — try again."}
+	end
+
+	local u = tostring(inputUser or ""):lower():gsub("%s","")
+	local k = tostring(inputKey  or ""):lower():gsub("%s","")
+
+	if u=="" or k=="" then
+		return {success=false, reason="Please fill in both fields."}
+	end
+
+	-- Already authed this session
+	if UsedSessions[player.UserId] then
+		return {success=true, tier=UsedSessions[player.UserId], isOwner=isOwner(player)}
+	end
+
+	-- Owner key — always works
+	if u==OWNER_USER and k==OWNER_KEY then
+		UsedSessions[player.UserId] = "Owner"
+		notifyOwners("🔑 Owner login: "..player.Name)
+		return {success=true, tier="Owner", isOwner=true}
+	end
+
+	-- Check generated keys table
+	for _, entry in ipairs(VALID_KEYS) do
+		local eu = tostring(entry.username or ""):lower():gsub("%s","")
+		local ek = tostring(entry.key     or ""):lower():gsub("%s","")
+		if eu==u and ek==k then
+			UsedSessions[player.UserId] = entry.tier or "VIP"
+			notifyOwners("🔑 "..player.Name.." logged in ["..entry.tier.."] as "..entry.username)
+			return {success=true, tier=entry.tier or "VIP", isOwner=false}
+		end
+	end
+
+	-- Rejected — key not in table, random guess rejected
+	notifyOwners("⚠ Failed login by "..player.Name.." (wrong credentials)")
+	return {success=false, reason="Invalid username or key. Keys must come from the admin portal."}
+end
+
+-- Clean up on leave
+Players.PlayerRemoving:Connect(function(p)
+	UsedSessions[p.UserId]  = nil
+	CurseWarnings[p.UserId] = nil
+end)
+
+-- ══════════════════════════════════════════════════════════════════
+--  CHAT AI — curse warning + friendly responses
+-- ══════════════════════════════════════════════════════════════════
+local BAD_WORDS = {
+	"fuck","shit","bitch","cunt","damn","piss","cock","dick",
+	"pussy","bastard","whore","slut","retard","fag","faggot",
+	"kys","stfu","fuk","fuq","sht","btch","a$$","fvck","shiit",
+}
+
+local AI_REPLIES = {
+	{q={"hi ","hello","hey ","sup "},       a="Hey! 👋 I'm the A.APK.PANEL AI. Stay cool and follow the rules!"},
+	{q={"who are you","what are you"},       a="I'm the A.APK.PANEL AI 🤖 — I monitor chat and assist admins."},
+	{q={"who is owner","who owns","whos the owner"}, a="👑 Kshusha319 is the owner. Show some respect!"},
+	{q={"how get admin","want admin","give admin","need admin"}, a="Admin is invite-only. Only Kshusha319 decides who gets it. 🔐"},
+	{q={"rules","server rules"},             a="📋 Rules: No exploiting, no spam, respect everyone, listen to admins."},
+	{q={"help","what do i do"},              a="Ask a mod or admin for help! I can only answer basic questions. 🛡"},
+	{q={"good bot","nice bot","ur cool","you cool"}, a="Thanks! 😊 Keep following the rules and we'll get along great."},
+	{q={"admin online","is admin here","mod online"}, a="Admins are always watching — even when invisible! 👁"},
+	{q={"how to play","how do i play"},      a="Just explore and have fun! Ask an admin if you need specific help. 🎮"},
+}
+
+local function hasBadWord(msg)
+	local lo = msg:lower()
+	for _, w in ipairs(BAD_WORDS) do
+		if lo:find(w, 1, true) then return true, w end
+	end
+	return false, nil
+end
+
+local function getReply(msg)
+	local lo = msg:lower()
+	for _, r in ipairs(AI_REPLIES) do
+		for _, q in ipairs(r.q) do
+			if lo:find(q, 1, true) then return r.a end
+		end
+	end
+	return nil
+end
+
+Players.PlayerAdded:Connect(function(player)
+	CurseWarnings[player.UserId] = 0
+
+	player.Chatted:Connect(function(msg)
+		if not msg or msg=="" then return end
+
+		-- Curse word check
+		local bad, word = hasBadWord(msg)
+		if bad then
+			CurseWarnings[player.UserId] = (CurseWarnings[player.UserId] or 0) + 1
+			local n = CurseWarnings[player.UserId]
+			local warnMsg
+			if n == 1 then
+				warnMsg = "⚠ Please keep chat clean. Cursing is not allowed here."
+			elseif n == 2 then
+				warnMsg = "⚠ Second warning. Next violation may result in a mute."
+			else
+				warnMsg = "🚫 Repeated violations flagged. An admin has been notified."
+				notifyOwners("🔴 "..player.Name.." has "..n.." language violations")
+			end
+			notify(player, warnMsg, "warning")
+			return
+		end
+
+		-- AI reply
+		local reply = getReply(msg)
+		if reply then
+			task.delay(0.9, function()
+				if not player.Parent then return end
+				-- Show as a hint so everyone sees it
+				local h = Instance.new("Hint", workspace)
+				h.Text = "🤖 A.APK.PANEL AI: " .. reply
+				Debris:AddItem(h, 6)
+				notify(player, "🤖 " .. reply, "info")
+			end)
+		end
+	end)
+end)
+
+print("╔═════════════════════════════════════════════╗")
+print("║  A.APK.PANEL KEY SERVER ✅ LOADED           ║")
+print("║  ValidateKey: ACTIVE                        ║")
+print("║  Chat AI: ACTIVE                            ║")
+print("║  Keys loaded: "..#VALID_KEYS.."                           ║")
+print("╚═════════════════════════════════════════════╝")
+
+-- ══════════════════════════════════════════════════════════════════
+--  LIVE KEY SYNC — polls Google Apps Script backend every 30s
+--  Paste your Apps Script deployment URL below
+-- ══════════════════════════════════════════════════════════════════
+local BACKEND_URL = "YOUR_GOOGLE_APPS_SCRIPT_URL_HERE"
+local BACKEND_TOKEN = "AAPK_SECRET_2024_KSHUSHA" -- must match Apps Script
+
+local function syncKeys()
+	if BACKEND_URL == "YOUR_GOOGLE_APPS_SCRIPT_URL_HERE" then return end
+	local ok, result = pcall(function()
+		local response = game:GetService("HttpService"):GetAsync(
+			BACKEND_URL .. "?action=get_keys&token=" .. BACKEND_TOKEN, true
+		)
+		local data = game:GetService("HttpService"):JSONDecode(response)
+		if data and data.success and data.keys then
+			-- Merge new keys in (don't remove existing ones)
+			local existing = {}
+			for _, k in ipairs(VALID_KEYS) do existing[k.username] = true end
+			local added = 0
+			for _, k in ipairs(data.keys) do
+				if not existing[k.username] then
+					table.insert(VALID_KEYS, {
+						username = k.username,
+						key      = k.key,
+						tier     = k.tier or "VIP"
+					})
+					existing[k.username] = true
+					added = added + 1
+				end
+			end
+			if added > 0 then
+				print("[A.APK.PANEL] 🔑 Synced "..added.." new key(s) from backend. Total: "..#VALID_KEYS)
+			end
+		end
+	end)
+	if not ok then
+		warn("[A.APK.PANEL] Key sync failed: "..tostring(result))
+	end
+end
+
+-- Sync on startup then every 30 seconds
+task.spawn(function()
+	task.wait(3)
+	syncKeys()
+	while true do
+		task.wait(30)
+		syncKeys()
+	end
+end)
