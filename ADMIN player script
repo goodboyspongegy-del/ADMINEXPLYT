@@ -1,0 +1,1785 @@
+--[[
+╔══════════════════════════════════════════════════════════════════╗
+║  A.APK.PANEL  v12  —  CLIENT  LocalScript                       ║
+║  StarterPlayerScripts → LocalScript                              ║
+║  Owner: Kshusha319  [6136351097]                                 ║
+║                                                                  ║
+║  REMOTES USED (all created by server script):                    ║
+║  Folder:  ReplicatedStorage/PhantomAdminRemotes                  ║
+║    AdminCommand       RemoteEvent                                ║
+║    AdminNotification  RemoteEvent                                ║
+║    AdminQuery         RemoteFunction                             ║
+║  Root RS:                                                        ║
+║    TriggerEvent       RemoteEvent                                ║
+║    EventUpdate        RemoteEvent                                ║
+║                                                                  ║
+║  OPEN/CLOSE:  ] key  or  F4                                      ║
+╚══════════════════════════════════════════════════════════════════╝
+--]]
+
+-- ════════════════════════════════════════════════════════════════
+--  SERVICES
+-- ════════════════════════════════════════════════════════════════
+local Players  = game:GetService("Players")
+local RS       = game:GetService("ReplicatedStorage")
+local UIS      = game:GetService("UserInputService")
+local TS       = game:GetService("TweenService")
+local Run      = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local WS       = workspace
+
+local lp    = Players.LocalPlayer
+local lpGui = lp:WaitForChild("PlayerGui")
+
+-- ════════════════════════════════════════════════════════════════
+--  OWNER CHECK
+-- ════════════════════════════════════════════════════════════════
+local OWNER_IDS = {6136351097}
+local function amOwner()
+	for _,id in ipairs(OWNER_IDS) do
+		if lp.UserId == id then return true end
+	end
+	return false
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  REMOTES  — blocking WaitForChild, GUARANTEED before any button
+-- ════════════════════════════════════════════════════════════════
+local RF        = RS:WaitForChild("PhantomAdminRemotes", 30)
+local AdminCmd  = RF and RF:WaitForChild("AdminCommand",      30) or nil
+local AdminNotif= RF and RF:WaitForChild("AdminNotification", 30) or nil
+local AdminQuery= RF and RF:WaitForChild("AdminQuery",        30) or nil
+local TriggerEv = RS:FindFirstChild("TriggerEvent") or RS:WaitForChild("TriggerEvent",10)
+local EventUpd  = RS:FindFirstChild("EventUpdate")  or RS:WaitForChild("EventUpdate", 10)
+
+if not AdminCmd then
+	warn("[A.APK.PANEL] ⚠ AdminCommand not found! Is the server script running?")
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  FIRE — the ONE function that sends commands
+-- ════════════════════════════════════════════════════════════════
+local function fire(cmd, ...)
+	if AdminCmd then
+		AdminCmd:FireServer(cmd, ...)
+	else
+		warn("[A.APK.PANEL] fire() called but AdminCmd is nil — cmd: "..tostring(cmd))
+	end
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  STATE
+-- ════════════════════════════════════════════════════════════════
+local panelOpen  = false
+local adminOK    = amOwner()
+local selPlayer  = nil   -- currently targeted player name
+local activeTab  = nil
+local flyOn      = false
+local flyConn    = nil
+local specConn   = nil
+local blindFr    = nil
+
+-- ════════════════════════════════════════════════════════════════
+--  TWEEN HELPERS
+-- ════════════════════════════════════════════════════════════════
+local function tween(obj, props, t, style, dir)
+	TS:Create(obj,
+		TweenInfo.new(t or .2, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out),
+		props):Play()
+end
+local function tweenBack(obj, props, t)
+	TS:Create(obj,
+		TweenInfo.new(t or .3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		props):Play()
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  COLOUR PALETTE  — sharp neon-on-black aesthetic
+-- ════════════════════════════════════════════════════════════════
+local C = {
+	-- Backgrounds
+	BG    = Color3.fromRGB(5,  5,  8),
+	BG1   = Color3.fromRGB(9,  9, 14),
+	BG2   = Color3.fromRGB(14,14, 22),
+	BG3   = Color3.fromRGB(20,20, 32),
+	BG4   = Color3.fromRGB(26,26, 42),
+	-- Accents
+	ACC   = Color3.fromRGB(0, 255, 180),   -- main neon teal
+	ACC2  = Color3.fromRGB(120, 80, 255),  -- purple accent
+	RED   = Color3.fromRGB(255, 60,  60),
+	ORG   = Color3.fromRGB(255,160,  30),
+	YEL   = Color3.fromRGB(255,220,  30),
+	GRN   = Color3.fromRGB( 30,255, 100),
+	CYN   = Color3.fromRGB( 30,200,255),
+	PNK   = Color3.fromRGB(255, 60, 160),
+	PRP   = Color3.fromRGB(160, 80,255),
+	-- Text
+	T1    = Color3.fromRGB(240,242,255),
+	T2    = Color3.fromRGB(140,145,180),
+	T3    = Color3.fromRGB( 70, 75,110),
+	BORD  = Color3.fromRGB( 30, 32, 50),
+}
+
+-- ════════════════════════════════════════════════════════════════
+--  UI FACTORY FUNCTIONS
+-- ════════════════════════════════════════════════════════════════
+local function Frame(par, props)
+	local f = Instance.new("Frame", par)
+	f.BorderSizePixel = 0
+	for k,v in pairs(props or {}) do f[k] = v end
+	return f
+end
+
+local function Label(par, props)
+	local l = Instance.new("TextLabel", par)
+	l.BorderSizePixel = 0
+	l.BackgroundTransparency = 1
+	l.Font = Enum.Font.GothamBold
+	l.TextColor3 = C.T1
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	for k,v in pairs(props or {}) do l[k] = v end
+	return l
+end
+
+local function Button(par, props)
+	local b = Instance.new("TextButton", par)
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = false
+	b.Font = Enum.Font.GothamBold
+	b.TextColor3 = C.T1
+	for k,v in pairs(props or {}) do b[k] = v end
+	return b
+end
+
+local function TextBox(par, props)
+	local b = Instance.new("TextBox", par)
+	b.BorderSizePixel = 0
+	b.Font = Enum.Font.GothamMedium
+	b.ClearTextOnFocus = false
+	b.TextColor3 = C.T1
+	for k,v in pairs(props or {}) do b[k] = v end
+	return b
+end
+
+local function Scroll(par, props)
+	local s = Instance.new("ScrollingFrame", par)
+	s.BorderSizePixel = 0
+	s.BackgroundTransparency = 1
+	s.ScrollBarThickness = 3
+	s.ScrollBarImageColor3 = C.ACC
+	s.CanvasSize = UDim2.new(0,0,0,0)
+	s.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	for k,v in pairs(props or {}) do s[k] = v end
+	return s
+end
+
+local function Corner(obj, r)
+	local c = Instance.new("UICorner", obj)
+	c.CornerRadius = UDim.new(0, r or 8)
+end
+
+local function Stroke(obj, col, th)
+	local e = obj:FindFirstChildOfClass("UIStroke")
+	if e then e:Destroy() end
+	local s = Instance.new("UIStroke", obj)
+	s.Color = col or C.BORD
+	s.Thickness = th or 1
+	return s
+end
+
+local function Pad(obj, t, b, l, r)
+	local p = Instance.new("UIPadding", obj)
+	p.PaddingTop    = UDim.new(0, t or 0)
+	p.PaddingBottom = UDim.new(0, b or 0)
+	p.PaddingLeft   = UDim.new(0, l or 0)
+	p.PaddingRight  = UDim.new(0, r or 0)
+end
+
+local function ListLayout(obj, dir, gap)
+	local l = Instance.new("UIListLayout", obj)
+	l.FillDirection = dir or Enum.FillDirection.Vertical
+	l.SortOrder = Enum.SortOrder.LayoutOrder
+	l.Padding = UDim.new(0, gap or 6)
+	return l
+end
+
+local function GridLayout(obj, cs, cp)
+	local g = Instance.new("UIGridLayout", obj)
+	g.CellSize    = cs or UDim2.new(0,170,0,38)
+	g.CellPadding = cp or UDim2.new(0,5,0,5)
+	g.SortOrder   = Enum.SortOrder.LayoutOrder
+	return g
+end
+
+local function Gradient(obj, c1, c2, rot)
+	local g = Instance.new("UIGradient", obj)
+	g.Color    = ColorSequence.new(c1, c2)
+	g.Rotation = rot or 90
+	return g
+end
+
+local function Hover(btn, norm, hov)
+	btn.MouseEnter:Connect(function()  tween(btn,{BackgroundColor3=hov}, .12) end)
+	btn.MouseLeave:Connect(function()  tween(btn,{BackgroundColor3=norm},.12) end)
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  SCREEN GUI
+-- ════════════════════════════════════════════════════════════════
+local SG = Instance.new("ScreenGui")
+SG.Name            = "AAPK_v12"
+SG.ResetOnSpawn    = false
+SG.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+SG.IgnoreGuiInset  = true
+SG.Parent          = lpGui
+
+-- ════════════════════════════════════════════════════════════════
+--  NOTIFICATION SYSTEM  (bottom-right, stacks upward)
+-- ════════════════════════════════════════════════════════════════
+local notifHolder = Frame(SG, {
+	Name = "NotifHolder",
+	Size = UDim2.new(0,310,0,0),
+	AnchorPoint = Vector2.new(1,1),
+	Position = UDim2.new(1,-14,1,-14),
+	BackgroundTransparency = 1,
+	ZIndex = 9000,
+	AutomaticSize = Enum.AutomaticSize.Y,
+})
+local notifLL = ListLayout(notifHolder, Enum.FillDirection.Vertical, 5)
+notifLL.VerticalAlignment = Enum.VerticalAlignment.Bottom
+
+local NOTIF_COLS = {
+	success = C.GRN, error = C.RED, info = C.ACC, warning = C.YEL
+}
+local NOTIF_ICONS = {
+	success = "✅", error = "❌", info = "⚡", warning = "⚠"
+}
+
+local function notif(msg, typ, dur)
+	if not msg or msg == "" then return end
+	typ = typ or "info"
+	dur = dur or 4
+	local col  = NOTIF_COLS[typ]  or C.ACC
+	local icon = NOTIF_ICONS[typ] or "⚡"
+
+	local card = Frame(notifHolder, {
+		Name = "Notif",
+		Size = UDim2.new(1,0,0,0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = C.BG1,
+		ZIndex = 9001,
+		ClipsDescendants = true,
+	})
+	Corner(card, 10)
+	Stroke(card, col, 1.5)
+
+	-- Top color line
+	local topLine = Frame(card, {
+		Size = UDim2.new(1,0,0,2),
+		BackgroundColor3 = col,
+		ZIndex = 9002,
+	})
+	Gradient(topLine, col, Color3.new(col.R*.4,col.G*.4,col.B*.4), 90)
+
+	-- Left accent
+	Frame(card, {
+		Size = UDim2.new(0,3,1,0),
+		BackgroundColor3 = col,
+		ZIndex = 9002,
+	})
+
+	local inner = Frame(card, {
+		Size = UDim2.new(1,-8,1,0),
+		Position = UDim2.new(0,5,0,0),
+		BackgroundTransparency = 1,
+		AutomaticSize = Enum.AutomaticSize.Y,
+		ZIndex = 9002,
+	})
+	Pad(inner, 8, 8, 6, 6)
+
+	Label(inner, {
+		Text = icon.."  "..tostring(msg),
+		TextSize = 12,
+		Font = Enum.Font.GothamMedium,
+		TextColor3 = C.T1,
+		Size = UDim2.new(1,0,0,0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		ZIndex = 9003,
+	})
+
+	task.spawn(function()
+		task.wait(0.02)
+		card.AutomaticSize = Enum.AutomaticSize.Y
+		task.wait(dur)
+		if card.Parent then
+			tween(card,{BackgroundTransparency=1},.3)
+			task.wait(.32)
+			if card.Parent then card:Destroy() end
+		end
+	end)
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  OPEN/CLOSE BUTTON  (left side, floating)
+-- ════════════════════════════════════════════════════════════════
+local toggleBtn = Button(SG, {
+	Name = "AAPK_ToggleBtn",
+	Size = UDim2.new(0,48,0,48),
+	Position = UDim2.new(0,12,0.5,-24),
+	BackgroundColor3 = C.BG1,
+	Text = "",
+	ZIndex = 500,
+	Visible = adminOK,
+})
+Corner(toggleBtn, 14)
+Stroke(toggleBtn, C.ACC, 2)
+Gradient(toggleBtn, C.BG1, C.BG2, 135)
+
+-- Icon inside
+Label(toggleBtn, {
+	Text = "⚡",
+	TextSize = 22,
+	Font = Enum.Font.GothamBlack,
+	TextColor3 = C.ACC,
+	Size = UDim2.new(1,0,0.6,0),
+	Position = UDim2.new(0,0,0.08,0),
+	TextXAlignment = Enum.TextXAlignment.Center,
+	ZIndex = 501,
+})
+Label(toggleBtn, {
+	Text = "APK",
+	TextSize = 8,
+	Font = Enum.Font.GothamBold,
+	TextColor3 = C.T3,
+	Size = UDim2.new(1,0,0,10),
+	Position = UDim2.new(0,0,0.74,0),
+	TextXAlignment = Enum.TextXAlignment.Center,
+	ZIndex = 501,
+})
+
+-- Glow ring
+local glowRing = Frame(SG, {
+	Name = "AAPK_GlowRing",
+	Size = UDim2.new(0,60,0,60),
+	Position = UDim2.new(0,6,0.5,-30),
+	BackgroundColor3 = C.ACC,
+	BackgroundTransparency = 0.7,
+	ZIndex = 498,
+	Visible = adminOK,
+})
+Corner(glowRing, 18)
+
+-- Pulse animation
+task.spawn(function()
+	while SG.Parent do
+		tween(glowRing,{BackgroundTransparency=0.85,Size=UDim2.new(0,64,0,64),Position=UDim2.new(0,4,0.5,-32)},1.6,Enum.EasingStyle.Sine)
+		task.wait(1.6)
+		tween(glowRing,{BackgroundTransparency=0.6,Size=UDim2.new(0,56,0,56),Position=UDim2.new(0,8,0.5,-28)},1.6,Enum.EasingStyle.Sine)
+		task.wait(1.6)
+	end
+end)
+
+-- Drag toggle button
+do
+	local down, startPos, startBtnPos = false, nil, nil
+	toggleBtn.InputBegan:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+			down = true; startPos = inp.Position; startBtnPos = toggleBtn.Position
+		end
+	end)
+	UIS.InputChanged:Connect(function(inp)
+		if not down then return end
+		if inp.UserInputType == Enum.UserInputType.MouseMovement then
+			local d = inp.Position - startPos
+			toggleBtn.Position = UDim2.new(
+				startBtnPos.X.Scale, startBtnPos.X.Offset + d.X,
+				startBtnPos.Y.Scale, startBtnPos.Y.Offset + d.Y
+			)
+			glowRing.Position = UDim2.new(
+				toggleBtn.Position.X.Scale, toggleBtn.Position.X.Offset - 6,
+				toggleBtn.Position.Y.Scale, toggleBtn.Position.Y.Offset - 6
+			)
+		end
+	end)
+	UIS.InputEnded:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 then down = false end
+	end)
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  MAIN PANEL WINDOW
+-- ════════════════════════════════════════════════════════════════
+local Panel = Frame(SG, {
+	Name = "AAPK_Panel",
+	Size = UDim2.new(0,940,0,580),
+	AnchorPoint = Vector2.new(0.5,0.5),
+	Position = UDim2.new(0.5,0,0.5,0),
+	BackgroundColor3 = C.BG,
+	Visible = false,
+	ZIndex = 200,
+	ClipsDescendants = true,
+})
+Corner(Panel, 14)
+Stroke(Panel, C.ACC, 1.5)
+
+-- Panel open/close
+local function openPanel()
+	if panelOpen then return end
+	panelOpen = true
+	Panel.Visible = true
+	Panel.Size = UDim2.new(0,0,0,0)
+	tweenBack(Panel, {Size=UDim2.new(0,940,0,580)}, .32)
+end
+
+local function closePanel()
+	if not panelOpen then return end
+	panelOpen = false
+	tween(Panel,{Size=UDim2.new(0,0,0,0)},.2,Enum.EasingStyle.Back,Enum.EasingDirection.In)
+	task.delay(.22, function() if not panelOpen then Panel.Visible = false end end)
+end
+
+-- ── HEADER ────────────────────────────────────────────────────────
+local Header = Frame(Panel, {
+	Size = UDim2.new(1,0,0,54),
+	BackgroundColor3 = C.BG1,
+	ZIndex = 210,
+})
+Gradient(Header, C.BG1, C.BG, 180)
+
+-- Accent line at bottom of header
+local hLine = Frame(Header, {
+	Size = UDim2.new(1,0,0,1),
+	Position = UDim2.new(0,0,1,-1),
+	ZIndex = 211,
+})
+Gradient(hLine, C.ACC, C.ACC2, 90)
+
+-- Logo
+Label(Header, {
+	Text = "⚡ A.APK",
+	TextSize = 20,
+	Font = Enum.Font.GothamBlack,
+	TextColor3 = C.ACC,
+	Size = UDim2.new(0,120,1,0),
+	Position = UDim2.new(0,14,0,0),
+	ZIndex = 211,
+})
+Label(Header, {
+	Text = ".PANEL",
+	TextSize = 20,
+	Font = Enum.Font.GothamBlack,
+	TextColor3 = C.T2,
+	Size = UDim2.new(0,90,1,0),
+	Position = UDim2.new(0,108,0,0),
+	ZIndex = 211,
+})
+
+-- Target ticker
+local tickerLbl = Label(Header, {
+	Text = "No target",
+	TextSize = 11,
+	Font = Enum.Font.GothamMedium,
+	TextColor3 = C.T3,
+	Size = UDim2.new(0,280,1,0),
+	Position = UDim2.new(0,230,0,0),
+	ZIndex = 211,
+})
+
+-- Live target info
+task.spawn(function()
+	while SG.Parent do
+		if selPlayer then
+			local p = Players:FindFirstChild(selPlayer)
+			if p then
+				local h = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+				if h then
+					tickerLbl.Text = "🎯 "..p.Name.."  ❤"..math.floor(h.Health).."/"..math.floor(h.MaxHealth).."  💨"..math.floor(h.WalkSpeed)
+					tickerLbl.TextColor3 = C.ACC
+				else
+					tickerLbl.Text = "🎯 "..p.Name.." (loading)"
+					tickerLbl.TextColor3 = C.T3
+				end
+			else
+				tickerLbl.Text = "🎯 "..selPlayer.." (offline)"
+				tickerLbl.TextColor3 = C.T3
+			end
+		else
+			tickerLbl.Text = "No target selected"
+			tickerLbl.TextColor3 = C.T3
+		end
+		task.wait(0.4)
+	end
+end)
+
+-- Close button
+local closeBtn = Button(Header, {
+	Size = UDim2.new(0,34,0,28),
+	Position = UDim2.new(1,-44,0,13),
+	BackgroundColor3 = Color3.new(C.RED.R*.2,C.RED.G*.2,C.RED.B*.2),
+	Text = "✕",
+	TextSize = 14,
+	Font = Enum.Font.GothamBlack,
+	TextColor3 = C.RED,
+	ZIndex = 212,
+})
+Corner(closeBtn, 7)
+Hover(closeBtn, Color3.new(C.RED.R*.2,C.RED.G*.2,C.RED.B*.2), Color3.new(C.RED.R*.35,C.RED.G*.35,C.RED.B*.35))
+closeBtn.MouseButton1Click:Connect(closePanel)
+
+-- Panel drag
+do
+	local down, sp, sbp = false, nil, nil
+	Header.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 then
+			down=true; sp=i.Position; sbp=Panel.Position
+		end
+	end)
+	UIS.InputChanged:Connect(function(i)
+		if down and i.UserInputType==Enum.UserInputType.MouseMovement then
+			local d=i.Position-sp
+			Panel.Position=UDim2.new(sbp.X.Scale,sbp.X.Offset+d.X,sbp.Y.Scale,sbp.Y.Offset+d.Y)
+		end
+	end)
+	UIS.InputEnded:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.MouseButton1 then down=false end
+	end)
+end
+
+-- ── SIDEBAR ───────────────────────────────────────────────────────
+local SIDEBAR_W = 156
+local Sidebar = Frame(Panel, {
+	Size = UDim2.new(0,SIDEBAR_W,1,-54),
+	Position = UDim2.new(0,0,0,54),
+	BackgroundColor3 = C.BG1,
+	ZIndex = 210,
+})
+Gradient(Sidebar, C.BG1, C.BG, 180)
+
+-- Right border on sidebar
+local sRight = Frame(Sidebar, {
+	Size = UDim2.new(0,1,1,0),
+	Position = UDim2.new(1,-1,0,0),
+	BackgroundColor3 = C.BORD,
+	ZIndex = 211,
+})
+
+local SideScroll = Scroll(Sidebar, {
+	Size = UDim2.new(1,-2,1,0),
+	BackgroundTransparency = 1,
+	ZIndex = 211,
+	ScrollBarThickness = 2,
+})
+ListLayout(SideScroll, Enum.FillDirection.Vertical, 2)
+Pad(SideScroll, 8, 8, 6, 6)
+
+-- ── CONTENT AREA ──────────────────────────────────────────────────
+local Content = Frame(Panel, {
+	Size = UDim2.new(1,-SIDEBAR_W,1,-54),
+	Position = UDim2.new(0,SIDEBAR_W,0,54),
+	BackgroundTransparency = 1,
+	ZIndex = 205,
+	ClipsDescendants = true,
+})
+
+-- ════════════════════════════════════════════════════════════════
+--  TAB SYSTEM
+-- ════════════════════════════════════════════════════════════════
+local pages    = {}
+local sideBtns = {}
+local activeTabName = ""
+
+local TABS = {
+	{n="Players",      i="👥", c=C.CYN},
+	{n="Moderation",   i="🔨", c=C.RED},
+	{n="Teleport",     i="📍", c=C.ACC},
+	{n="Effects",      i="✨", c=C.PRP},
+	{n="Fun & Chaos",  i="💥", c=C.ORG},
+	{n="World",        i="🌍", c=C.GRN},
+	{n="BubbleChat",   i="💬", c=C.PNK},
+	{n="Events",       i="🎮", c=C.YEL},
+	{n="Server",       i="🖥",  c=C.CYN},
+	{n="Settings",     i="⚙",  c=C.T2},
+}
+
+local function switchTab(name)
+	if activeTabName == name then return end
+	activeTabName = name
+	for n, pg in pairs(pages) do
+		pg.Visible = (n == name)
+	end
+	for n, btn in pairs(sideBtns) do
+		local col = btn._col
+		local active = (n == name)
+		tween(btn, {
+			BackgroundColor3 = active
+				and Color3.new(col.R*.18,col.G*.18,col.B*.18)
+				or  Color3.new(0,0,0),
+			TextColor3 = active and col or C.T3,
+		}, .15)
+		local bar = btn:FindFirstChild("Bar")
+		if bar then
+			tween(bar, {BackgroundColor3 = active and col or Color3.new(0,0,0)}, .15)
+		end
+	end
+end
+
+for i, td in ipairs(TABS) do
+	-- Sidebar button
+	local btn = Button(SideScroll, {
+		Name = "Tab_"..td.n,
+		Size = UDim2.new(1,0,0,36),
+		BackgroundColor3 = Color3.new(0,0,0),
+		Text = " "..td.i.."  "..td.n,
+		TextSize = 11,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = C.T3,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = i,
+		ZIndex = 212,
+	})
+	Corner(btn, 7)
+	Pad(btn, 0, 0, 8, 0)
+	btn._col = td.c
+
+	-- Active indicator bar
+	local bar = Frame(btn, {
+		Name = "Bar",
+		Size = UDim2.new(0,3,0.7,0),
+		Position = UDim2.new(0,0,0.15,0),
+		BackgroundColor3 = Color3.new(0,0,0),
+		ZIndex = 213,
+	})
+	Corner(bar, 2)
+
+	btn.MouseEnter:Connect(function()
+		if activeTabName~=td.n then
+			tween(btn,{BackgroundColor3=Color3.new(td.c.R*.08,td.c.G*.08,td.c.B*.08)},.1)
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		if activeTabName~=td.n then
+			tween(btn,{BackgroundColor3=Color3.new(0,0,0)},.1)
+		end
+	end)
+	btn.MouseButton1Click:Connect(function() switchTab(td.n) end)
+	sideBtns[td.n] = btn
+
+	-- Page frame
+	local pg = Frame(Content, {
+		Name = "Page_"..td.n,
+		Size = UDim2.new(1,0,1,0),
+		BackgroundTransparency = 1,
+		Visible = false,
+		ZIndex = 206,
+		ClipsDescendants = true,
+	})
+	pages[td.n] = pg
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  SHARED CONFIRM POPUP
+-- ════════════════════════════════════════════════════════════════
+local ConfirmPopup = Frame(Panel, {
+	Size = UDim2.new(0,380,0,200),
+	AnchorPoint = Vector2.new(0.5,0.5),
+	Position = UDim2.new(0.5,0,0.5,0),
+	BackgroundColor3 = C.BG1,
+	Visible = false,
+	ZIndex = 290,
+})
+Corner(ConfirmPopup, 14)
+Stroke(ConfirmPopup, C.ACC, 2)
+Gradient(ConfirmPopup, C.BG1, C.BG2, 160)
+
+local cpTopBar = Frame(ConfirmPopup, {Size=UDim2.new(1,0,0,2),ZIndex=291})
+Gradient(cpTopBar, C.ACC, C.ACC2, 90)
+
+local cpAv = Instance.new("ImageLabel", ConfirmPopup)
+cpAv.Size = UDim2.new(0,52,0,52); cpAv.Position = UDim2.new(0,14,0,14)
+cpAv.BackgroundColor3 = C.BG2; cpAv.ZIndex = 291
+Corner(cpAv, 8); Stroke(cpAv, C.ACC, 1.5)
+
+local cpName  = Label(ConfirmPopup, {Text="",TextSize=18,Font=Enum.Font.GothamBlack,Size=UDim2.new(1,-80,0,24),Position=UDim2.new(0,76,0,14),ZIndex=291})
+local cpSub   = Label(ConfirmPopup, {Text="",TextSize=11,Font=Enum.Font.GothamMedium,TextColor3=C.T3,Size=UDim2.new(1,-80,0,16),Position=UDim2.new(0,76,0,38),ZIndex=291})
+local cpQ     = Label(ConfirmPopup, {Text="",TextSize=13,Font=Enum.Font.GothamMedium,TextColor3=C.T2,Size=UDim2.new(1,-28,0,18),Position=UDim2.new(0,14,0,80),ZIndex=291,TextXAlignment=Enum.TextXAlignment.Center})
+local cpBtnRow= Frame(ConfirmPopup, {Size=UDim2.new(1,-28,0,40),Position=UDim2.new(0,14,0,108),BackgroundTransparency=1,ZIndex=291})
+ListLayout(cpBtnRow, Enum.FillDirection.Horizontal, 10)
+
+local cpYes = Button(cpBtnRow, {
+	Size=UDim2.new(0,160,1,0),
+	BackgroundColor3=Color3.new(C.GRN.R*.18,C.GRN.G*.18,C.GRN.B*.18),
+	Text="✅ Confirm",TextSize=13,Font=Enum.Font.GothamBlack,TextColor3=C.GRN,ZIndex=292
+})
+Corner(cpYes,8); Stroke(cpYes,C.GRN,1.5)
+Hover(cpYes, Color3.new(C.GRN.R*.18,C.GRN.G*.18,C.GRN.B*.18), Color3.new(C.GRN.R*.32,C.GRN.G*.32,C.GRN.B*.32))
+
+local cpNo = Button(cpBtnRow, {
+	Size=UDim2.new(0,160,1,0),
+	BackgroundColor3=C.BG3,
+	Text="✕ Cancel",TextSize=13,Font=Enum.Font.GothamBold,TextColor3=C.T2,ZIndex=292
+})
+Corner(cpNo,8)
+Hover(cpNo, C.BG3, C.BG4)
+
+local cpCallback = nil
+local function closeConfirm()
+	ConfirmPopup.Visible = false
+	cpCallback = nil
+end
+
+local function showConfirm(player, question, cb)
+	cpCallback = cb
+	cpAv.Image = "rbxthumb://type=AvatarHeadShot&id="..player.UserId.."&w=48&h=48"
+	cpName.Text = player.DisplayName
+	cpSub.Text  = "@"..player.Name.."  ·  ID: "..player.UserId
+	cpQ.Text    = question or ("Target "..player.Name.."?")
+	ConfirmPopup.Visible = true
+	ConfirmPopup.Size = UDim2.new(0,380,0,0)
+	tweenBack(ConfirmPopup, {Size=UDim2.new(0,380,0,200)}, .28)
+end
+
+cpYes.MouseButton1Click:Connect(function()
+	closeConfirm()
+	if cpCallback then pcall(cpCallback) end
+end)
+cpNo.MouseButton1Click:Connect(closeConfirm)
+
+-- ════════════════════════════════════════════════════════════════
+--  AUTOCOMPLETE DROPDOWN
+-- ════════════════════════════════════════════════════════════════
+local AcDrop = Frame(Panel, {
+	Name = "AcDrop",
+	Size = UDim2.new(0,260,0,0),
+	BackgroundColor3 = C.BG1,
+	Visible = false,
+	ZIndex = 280,
+	ClipsDescendants = true,
+})
+Corner(AcDrop, 8)
+Stroke(AcDrop, C.ACC, 1.5)
+local AcList = Frame(AcDrop, {
+	Size = UDim2.new(1,0,1,0),
+	BackgroundTransparency = 1,
+	AutomaticSize = Enum.AutomaticSize.Y,
+	ZIndex = 281,
+})
+ListLayout(AcList, Enum.FillDirection.Vertical, 3)
+Pad(AcList, 4, 4, 4, 4)
+
+local function hideAc()
+	tween(AcDrop,{Size=UDim2.new(0,260,0,0)},.1)
+	task.delay(.12, function() AcDrop.Visible = false end)
+end
+
+local function showAcDropdown(box, matches, onPick)
+	for _, c in ipairs(AcList:GetChildren()) do
+		if c:IsA("Frame") then c:Destroy() end
+	end
+	if #matches == 0 then hideAc(); return end
+
+	local ap = box.AbsolutePosition
+	local pp = Panel.AbsolutePosition
+	local W  = math.max(box.AbsoluteSize.X, 260)
+
+	AcDrop.Position = UDim2.new(0, ap.X-pp.X, 0, ap.Y-pp.Y+box.AbsoluteSize.Y+4)
+	AcDrop.Visible  = true
+
+	for i, p in ipairs(matches) do
+		if i > 8 then break end
+		local row = Frame(AcList, {
+			Size = UDim2.new(1,0,0,38),
+			BackgroundColor3 = C.BG2,
+			ZIndex = 282,
+		})
+		Corner(row, 6)
+		Hover(row, C.BG2, C.BG3)
+
+		local av = Instance.new("ImageLabel", row)
+		av.Size = UDim2.new(0,24,0,24)
+		av.Position = UDim2.new(0,6,0.5,-12)
+		av.BackgroundTransparency=1
+		av.Image = "rbxthumb://type=AvatarHeadShot&id="..p.UserId.."&w=48&h=48"
+		av.ZIndex = 283
+		Corner(av,12)
+
+		Label(row,{Text=p.DisplayName,TextSize=13,Font=Enum.Font.GothamBold,Size=UDim2.new(1,-38,0,18),Position=UDim2.new(0,36,0,3),ZIndex=283})
+		Label(row,{Text="@"..p.Name,TextSize=10,Font=Enum.Font.GothamMedium,TextColor3=C.T3,Size=UDim2.new(1,-38,0,13),Position=UDim2.new(0,36,0,21),ZIndex=283})
+
+		local h = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+		if h and h.MaxHealth > 0 then
+			local pct = math.clamp(h.Health/h.MaxHealth,0,1)
+			local bg = Frame(row,{Size=UDim2.new(0,48,0,4),Position=UDim2.new(1,-54,1,-8),BackgroundColor3=C.BG4,ZIndex=283}); Corner(bg,2)
+			local fill = Frame(bg,{Size=UDim2.new(pct,0,1,0),BackgroundColor3=pct>.5 and C.GRN or (pct>.25 and C.YEL or C.RED),ZIndex=284}); Corner(fill,2)
+		end
+
+		local click = Button(row,{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text="",ZIndex=285})
+		click.MouseButton1Click:Connect(function()
+			hideAc()
+			onPick(p)
+		end)
+	end
+
+	local H = math.min(#matches,8)*42+8
+	tweenBack(AcDrop,{Size=UDim2.new(0,W,0,H)},.18)
+end
+
+-- Attach autocomplete to a TextBox
+local function attachAC(box, onConfirmed, question)
+	local deb = false
+	box:GetPropertyChangedSignal("Text"):Connect(function()
+		if deb then return end
+		local term = box.Text:lower()
+		if #term < 1 then hideAc(); return end
+		local matches = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			local pn = p.Name:lower(); local dn = p.DisplayName:lower()
+			if pn:find(term,1,true) or dn:find(term,1,true) then
+				table.insert(matches, p)
+			end
+		end
+		if #matches == 0 then hideAc(); return end
+		showAcDropdown(box, matches, function(p)
+			deb = true; box.Text = p.Name; deb = false
+			if onConfirmed then
+				showConfirm(p, question, function()
+					selPlayer = p.Name
+					onConfirmed(p.Name)
+				end)
+			else
+				selPlayer = p.Name
+				notif("🎯 Target: "..p.DisplayName,"info",2)
+			end
+		end)
+	end)
+
+	box.FocusLost:Connect(function(enter)
+		task.delay(.14, function()
+			hideAc()
+			if enter and box.Text ~= "" then
+				local lo = box.Text:lower()
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p.Name:lower():find(lo,1,true) or p.DisplayName:lower():find(lo,1,true) then
+						if onConfirmed then
+							showConfirm(p, question, function()
+								selPlayer = p.Name
+								box.Text  = p.Name
+								onConfirmed(p.Name)
+							end)
+						else
+							selPlayer = p.Name
+							box.Text  = p.Name
+							notif("🎯 Target: "..p.DisplayName,"info",2)
+						end
+						break
+					end
+				end
+			end
+		end)
+	end)
+end
+
+UIS.InputBegan:Connect(function(inp)
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+		local mp = inp.Position
+		local dp = AcDrop.AbsolutePosition
+		local ds = AcDrop.AbsoluteSize
+		if not(mp.X>=dp.X and mp.X<=dp.X+ds.X and mp.Y>=dp.Y and mp.Y<=dp.Y+ds.Y) then
+			task.delay(.1, hideAc)
+		end
+	end
+	if inp.KeyCode == Enum.KeyCode.Escape then
+		hideAc(); closeConfirm()
+	end
+end)
+
+-- ════════════════════════════════════════════════════════════════
+--  BUTTON FACTORY  (for command grids)
+-- ════════════════════════════════════════════════════════════════
+local function mkCmdBtn(par, label, col, fn, lo)
+	col = col or C.ACC
+	local dim = Color3.new(col.R*.14,col.G*.14,col.B*.14)
+	local hov = Color3.new(col.R*.26,col.G*.26,col.B*.26)
+	local btn = Button(par, {
+		Text = label,
+		BackgroundColor3 = dim,
+		TextColor3 = col,
+		TextSize = 11,
+		LayoutOrder = lo or 0,
+		ZIndex = 208,
+	})
+	Corner(btn, 8)
+	Stroke(btn, Color3.new(col.R*.3,col.G*.3,col.B*.3), 1)
+	Hover(btn, dim, hov)
+	btn.MouseButton1Click:Connect(function()
+		tween(btn,{BackgroundColor3=Color3.new(col.R*.5,col.G*.5,col.B*.5)},.05)
+		task.delay(.12,function() tween(btn,{BackgroundColor3=dim},.12) end)
+		local ok, err = pcall(fn)
+		if not ok then notif("❌ "..tostring(err):sub(1,60),"error") end
+	end)
+	return btn
+end
+
+local function mkInput(par, placeholder, yPos, w)
+	local box = TextBox(par, {
+		Size = UDim2.new(w or 1, 0, 0, 32),
+		Position = UDim2.new(0, 0, 0, yPos or 0),
+		PlaceholderText = placeholder or "Player name...",
+		PlaceholderColor3 = C.T3,
+		Text = "",
+		BackgroundColor3 = C.BG2,
+		TextSize = 13,
+		ZIndex = 207,
+	})
+	Corner(box, 7)
+	Stroke(box, C.BORD, 1.2)
+	Pad(box, 0, 0, 10, 0)
+	box.Focused:Connect(function()   Stroke(box, C.ACC, 1.8) end)
+	box.FocusLost:Connect(function() Stroke(box, C.BORD,1.2) end)
+	return box
+end
+
+local function sectionHeader(par, title, col)
+	local f = Frame(par,{Size=UDim2.new(1,0,0,20),BackgroundTransparency=1,ZIndex=207})
+	Frame(f,{Size=UDim2.new(0,3,1,0),BackgroundColor3=col or C.ACC,ZIndex=208})
+	Label(f,{Text="  "..title,TextSize=10,TextColor3=col or C.ACC,Font=Enum.Font.GothamBold,Size=UDim2.new(1,0,1,0),ZIndex=208})
+	return f
+end
+
+-- Build a grid page with sections
+local function buildGridPage(pgName, sections)
+	local pg = pages[pgName]
+	if not pg then return end
+	Pad(pg, 8, 8, 8, 8)
+	local sc = Scroll(pg, {Size=UDim2.new(1,0,1,0),ZIndex=207})
+	ListLayout(sc, Enum.FillDirection.Vertical, 8)
+	Pad(sc, 2, 8, 0, 0)
+
+	for _, sec in ipairs(sections) do
+		sectionHeader(sc, sec.title, sec.color)
+		local g = Frame(sc, {
+			BackgroundTransparency=1,
+			Size=UDim2.new(1,0,0,1),
+			AutomaticSize=Enum.AutomaticSize.Y,
+			ZIndex=207,
+		})
+		GridLayout(g, UDim2.new(0,174,0,38), UDim2.new(0,5,0,5))
+		Pad(g, 2, 4, 0, 0)
+		for lo, cd in ipairs(sec.cmds) do
+			mkCmdBtn(g, cd[1], cd[2], cd[3], lo)
+		end
+	end
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGE: PLAYERS
+-- ════════════════════════════════════════════════════════════════
+do
+	local pg = pages["Players"]
+	Pad(pg, 10, 10, 10, 10)
+
+	-- Search box with AC
+	local searchBox = mkInput(pg, "🔍 Search or select a player...", 0, 1)
+	attachAC(searchBox, function(name) selPlayer = name end, "Set as target?")
+
+	-- Player list
+	local listFrame = Frame(pg, {
+		Size=UDim2.new(1,0,0,200),
+		Position=UDim2.new(0,0,0,40),
+		BackgroundColor3=C.BG1,
+		ZIndex=207,
+	})
+	Corner(listFrame, 10)
+	Stroke(listFrame, C.BORD, 1)
+
+	local listSc = Scroll(listFrame, {
+		Size=UDim2.new(1,-4,1,-4),
+		Position=UDim2.new(0,2,0,2),
+		ZIndex=208,
+	})
+	ListLayout(listSc, Enum.FillDirection.Vertical, 3)
+	Pad(listSc, 4, 4, 4, 4)
+
+	local function refreshList(filter)
+		for _, c in ipairs(listSc:GetChildren()) do
+			if c:IsA("Frame") then c:Destroy() end
+		end
+		for _, p in ipairs(Players:GetPlayers()) do
+			if not filter or filter=="" or p.Name:lower():find(filter:lower(),1,true) or p.DisplayName:lower():find(filter:lower(),1,true) then
+				local isMe = (p == lp)
+				local row = Frame(listSc, {
+					Size=UDim2.new(1,0,0,40),
+					BackgroundColor3=C.BG2,
+					ZIndex=209,
+				})
+				Corner(row, 7)
+				if isMe then Stroke(row, C.YEL, 1) end
+
+				-- Avatar
+				local avF = Frame(row,{Size=UDim2.new(0,26,0,26),Position=UDim2.new(0,6,0.5,-13),BackgroundColor3=C.BG3,ZIndex=210})
+				Corner(avF,13)
+				local av = Instance.new("ImageLabel",avF)
+				av.Size=UDim2.new(1,0,1,0);av.BackgroundTransparency=1
+				av.Image="rbxthumb://type=AvatarHeadShot&id="..p.UserId.."&w=48&h=48"
+				av.ZIndex=211;Corner(av,13)
+
+				Label(row,{Text=p.DisplayName,TextSize=13,Font=Enum.Font.GothamBold,Size=UDim2.new(0,170,0,18),Position=UDim2.new(0,38,0,3),ZIndex=210})
+				Label(row,{Text="@"..p.Name..(isMe and " ★" or ""),TextSize=10,Font=Enum.Font.GothamMedium,TextColor3=isMe and C.YEL or C.T3,Size=UDim2.new(0,160,0,13),Position=UDim2.new(0,38,0,22),ZIndex=210})
+
+				-- HP bar
+				local h = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+				if h and h.MaxHealth > 0 then
+					local pct = math.clamp(h.Health/h.MaxHealth,0,1)
+					local bg=Frame(row,{Size=UDim2.new(0,60,0,5),Position=UDim2.new(0.7,0,0.5,-2),BackgroundColor3=C.BG4,ZIndex=210}); Corner(bg,3)
+					Frame(bg,{Size=UDim2.new(pct,0,1,0),BackgroundColor3=pct>.5 and C.GRN or (pct>.25 and C.YEL or C.RED),ZIndex=211})
+				end
+
+				-- Target button
+				local tBtn = Button(row,{
+					Size=UDim2.new(0,60,0,26),Position=UDim2.new(1,-66,0.5,-13),
+					BackgroundColor3=Color3.new(C.ACC.R*.18,C.ACC.G*.18,C.ACC.B*.18),
+					Text="TARGET",TextSize=10,Font=Enum.Font.GothamBlack,TextColor3=C.ACC,ZIndex=210
+				})
+				Corner(tBtn,6); Stroke(tBtn,C.ACC,1)
+				tBtn.MouseButton1Click:Connect(function()
+					selPlayer = p.Name
+					searchBox.Text = p.Name
+					notif("🎯 Targeting "..p.DisplayName,"info",2)
+				end)
+				Hover(tBtn,Color3.new(C.ACC.R*.18,C.ACC.G*.18,C.ACC.B*.18),Color3.new(C.ACC.R*.32,C.ACC.G*.32,C.ACC.B*.32))
+			end
+		end
+	end
+
+	refreshList()
+	searchBox:GetPropertyChangedSignal("Text"):Connect(function() refreshList(searchBox.Text) end)
+	Players.PlayerAdded:Connect(function() task.defer(function() refreshList(searchBox.Text) end) end)
+	Players.PlayerRemoving:Connect(function() task.defer(function() refreshList(searchBox.Text) end) end)
+
+	-- Status bar
+	local statBar = Frame(pg,{Size=UDim2.new(1,0,0,26),Position=UDim2.new(0,0,0,248),BackgroundColor3=C.BG2,ZIndex=207})
+	Corner(statBar,7); Stroke(statBar,C.BORD,1)
+	local statLbl = Label(statBar,{Text="Select a player above",TextSize=11,Font=Enum.Font.GothamMedium,TextColor3=C.T3,Size=UDim2.new(1,0,1,0),ZIndex=208})
+	Pad(statLbl,0,0,10,0)
+
+	task.spawn(function()
+		while SG.Parent do
+			if selPlayer then
+				local p=Players:FindFirstChild(selPlayer)
+				if p then
+					local h=p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+					if h then
+						statLbl.Text=string.format("🎯 %s · ❤ %d/%d · 💨 %d · ID: %d",p.Name,math.floor(h.Health),math.floor(h.MaxHealth),math.floor(h.WalkSpeed),p.UserId)
+						statLbl.TextColor3=C.ACC
+					end
+				end
+			end
+			task.wait(0.5)
+		end
+	end)
+
+	-- Quick command grid
+	local function gs() return selPlayer end
+	local function need() if not selPlayer then notif("⚠ Select a player first!","warning"); return false end; return true end
+
+	local cmdSc = Scroll(pg,{Size=UDim2.new(1,0,1,-282),Position=UDim2.new(0,0,0,280),ZIndex=207})
+	ListLayout(cmdSc,Enum.FillDirection.Vertical,8)
+	Pad(cmdSc,2,8,0,0)
+
+	local function addSection(title,col,cmds)
+		sectionHeader(cmdSc,title,col)
+		local g=Frame(cmdSc,{BackgroundTransparency=1,Size=UDim2.new(1,0,0,1),AutomaticSize=Enum.AutomaticSize.Y,ZIndex=207})
+		GridLayout(g,UDim2.new(0,174,0,38),UDim2.new(0,5,0,5)); Pad(g,2,4,0,0)
+		for lo,cd in ipairs(cmds) do mkCmdBtn(g,cd[1],cd[2],cd[3],lo) end
+	end
+
+	addSection("⚕ HEALTH",C.GRN,{
+		{"💚 Heal",       C.GRN, function() if need() then fire("heal",gs()) end end},
+		{"💀 Kill",       C.RED, function() if need() then fire("kill",gs()) end end},
+		{"⚔ Damage 50",  C.ORG, function() if need() then fire("damage",gs(),"50") end end},
+		{"💊 Heal 50",   C.GRN, function() if need() then fire("heal50",gs()) end end},
+		{"✨ God",        C.YEL, function() if need() then fire("god",gs()) end end},
+		{"🚫 Ungod",      C.T2,  function() if need() then fire("ungod",gs()) end end},
+		{"💚 Heal All",  C.GRN, function() fire("healall") end},
+		{"💀 Kill All",  C.RED, function() fire("killall") end},
+		{"✨ God All",   C.YEL, function() fire("godall") end},
+		{"🔄 Respawn",   C.CYN, function() if need() then fire("respawn",gs()) end end},
+		{"🔄 Resp All",  C.CYN, function() fire("respawnall") end},
+		{"🏥 MaxHP 500", C.GRN, function() if need() then fire("maxhealth",gs(),"500") end end},
+	})
+	addSection("⚡ MOVEMENT",C.CYN,{
+		{"⚡ Speed ×2",  C.CYN, function() if need() then fire("speed",gs(),"32") end end},
+		{"⚡ Speed ×5",  C.CYN, function() if need() then fire("speed",gs(),"80") end end},
+		{"🚀 Speed 200", C.CYN, function() if need() then fire("speed",gs(),"200") end end},
+		{"🐢 Slow",      C.T2,  function() if need() then fire("speed",gs(),"4") end end},
+		{"🔄 Speed Rst", C.GRN, function() if need() then fire("speed",gs(),"16") end end},
+		{"🌙 Moon Jump", C.PRP, function() if need() then fire("jumppower",gs(),"500") end end},
+		{"🔄 Jump Rst",  C.GRN, function() if need() then fire("jumppower",gs(),"50") end end},
+		{"🚀 Warp Spd",  C.CYN, function() fire("warpspeed") end},
+	})
+	addSection("🔒 CONTROL",C.ORG,{
+		{"🧊 Freeze",    C.CYN, function() if need() then fire("freeze",gs()) end end},
+		{"🔓 Unfreeze",  C.GRN, function() if need() then fire("unfreeze",gs()) end end},
+		{"❄ Freeze All", C.CYN, function() fire("freezeall") end},
+		{"🔓 Unfrz All", C.GRN, function() fire("unfreezeall") end},
+		{"🔐 Cuff",      C.ORG, function() if need() then fire("cuff",gs()) end end},
+		{"🔓 Uncuff",    C.GRN, function() if need() then fire("uncuff",gs()) end end},
+		{"🔒 Jail",      C.PRP, function() if need() then fire("jail",gs()) end end},
+		{"🔓 Unjail",    C.GRN, function() if need() then fire("unjail",gs()) end end},
+		{"🔇 Mute",      C.YEL, function() if need() then fire("mute",gs()) end end},
+		{"🔊 Unmute",    C.GRN, function() if need() then fire("unmute",gs()) end end},
+		{"🕊 Release All",C.GRN,function() fire("releaseall") end},
+	})
+	addSection("👁 APPEARANCE",C.PRP,{
+		{"👁 Invisible",  C.PRP, function() if need() then fire("invisible",gs()) end end},
+		{"👁 Visible",    C.GRN, function() if need() then fire("visible",gs()) end end},
+		{"🗼 Giant",      C.YEL, function() if need() then fire("giant",gs()) end end},
+		{"🐜 Tiny",       C.T2,  function() if need() then fire("tiny",gs()) end end},
+		{"🍔 Fat",        C.ORG, function() if need() then fire("fat",gs()) end end},
+		{"📏 Normal",     C.GRN, function() if need() then fire("normalsize",gs()) end end},
+		{"💛 Goldify",    C.YEL, function() if need() then fire("goldify",gs()) end end},
+		{"💚 Hacker",     C.GRN, function() if need() then fire("hackerskin",gs()) end end},
+		{"🌑 Void",       C.T3,  function() if need() then fire("voidskin",gs()) end end},
+		{"🌈 Rainbow",    C.PNK, function() if need() then fire("rainbow",gs()) end end},
+		{"🔥 Fire",       C.RED, function() if need() then fire("fire",gs()) end end},
+		{"✨ Sparkles",   C.PRP, function() if need() then fire("sparkles",gs()) end end},
+		{"🔄 Reset Look", C.GRN, function() if need() then fire("resetappearance",gs()) end end},
+	})
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGE: MODERATION
+-- ════════════════════════════════════════════════════════════════
+do
+	local pg = pages["Moderation"]
+	Pad(pg,10,10,10,10)
+
+	local nameBox = mkInput(pg,"👤 Player name...",0,0.55)
+	nameBox.Size = UDim2.new(0.55,-4,0,32)
+	attachAC(nameBox,nil,"Apply moderation to this player?")
+
+	local reasonBox = mkInput(pg,"📝 Reason (optional)...",0,0.44)
+	reasonBox.Size = UDim2.new(0.44,0,0,32)
+	reasonBox.Position = UDim2.new(0.56,0,0,0)
+
+	local function gN() return nameBox.Text ~= "" and nameBox.Text or selPlayer end
+	local function gR() return reasonBox.Text ~= "" and reasonBox.Text or "No reason given" end
+	local function nd() if not gN() then notif("⚠ Enter a player name","warning"); return false end; return true end
+
+	local cmdSc = Scroll(pg,{Size=UDim2.new(1,0,1,-42),Position=UDim2.new(0,0,0,40),ZIndex=207})
+	ListLayout(cmdSc,Enum.FillDirection.Vertical,8)
+	Pad(cmdSc,2,8,0,0)
+
+	local function addSec(t,c,cmds)
+		sectionHeader(cmdSc,t,c)
+		local g=Frame(cmdSc,{BackgroundTransparency=1,Size=UDim2.new(1,0,0,1),AutomaticSize=Enum.AutomaticSize.Y,ZIndex=207})
+		GridLayout(g,UDim2.new(0,174,0,38),UDim2.new(0,5,0,5)); Pad(g,2,4,0,0)
+		for lo,cd in ipairs(cmds) do mkCmdBtn(g,cd[1],cd[2],cd[3],lo) end
+	end
+
+	addSec("🔨 BAN / KICK",C.RED,{
+		{"👢 Kick",       C.RED, function() if nd() then fire("kick",gN(),gR()) end end},
+		{"☠ Perm Ban",   C.RED, function() if nd() then fire("ban",gN(),gR()) end end},
+		{"✅ Unban",      C.GRN, function() if nd() then fire("unban",gN()) end end},
+		{"⏱ TempBan 5m", C.ORG, function() if nd() then fire("tempban",gN(),"300",gR()) end end},
+		{"⏱ TempBan 10m",C.ORG, function() if nd() then fire("tempban",gN(),"600",gR()) end end},
+		{"👢 Kick All",   C.RED, function() fire("kickall",gR()) end},
+	})
+	addSec("⚠ WARN / MUTE",C.YEL,{
+		{"⚠ Warn",        C.YEL, function() if nd() then fire("warn",gN(),gR()) end end},
+		{"📋 See Warns",  C.YEL, function() if nd() then fire("warnings",gN()) end end},
+		{"🗑 Clr Warns",  C.T2,  function() if nd() then fire("clearwarnings",gN()) end end},
+		{"🔇 Mute",       C.YEL, function() if nd() then fire("mute",gN()) end end},
+		{"🔊 Unmute",     C.GRN, function() if nd() then fire("unmute",gN()) end end},
+		{"❌ Strike",     C.RED, function() if nd() then fire("addstrike",gN()) end end},
+	})
+	addSec("🔍 INVESTIGATE",C.CYN,{
+		{"🔍 Get Info",   C.CYN, function() if nd() then fire("getinfo",gN()) end end},
+		{"🛡 Protect",    C.CYN, function() if nd() then fire("protect",gN()) end end},
+		{"📋 Action Log", C.T2,  function() fire("getlog","20") end},
+		{"📊 Server Info",C.T2,  function() fire("serverinfo") end},
+		{"🏓 Ping",       C.GRN, function() fire("ping") end},
+	})
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGE: TELEPORT
+-- ════════════════════════════════════════════════════════════════
+do
+	local pg = pages["Teleport"]
+	Pad(pg,10,10,10,10)
+
+	local srcBox = mkInput(pg,"👤 Source player...",0,0.47)
+	srcBox.Size = UDim2.new(0.47,-3,0,32)
+	attachAC(srcBox,nil,"Teleport this player?")
+
+	local dstBox = mkInput(pg,"📍 Destination player...",0,0.47)
+	dstBox.Size = UDim2.new(0.47,-3,0,32)
+	dstBox.Position = UDim2.new(0.53,0,0,0)
+	attachAC(dstBox,nil,"Set as destination?")
+
+	local function gSrc() return srcBox.Text ~= "" and srcBox.Text or selPlayer end
+	local function gDst() return dstBox.Text end
+	local function nd() if not gSrc() then notif("⚠ Enter source player","warning"); return false end; return true end
+
+	-- Coordinate inputs
+	local xB=TextBox(pg,{Size=UDim2.new(0.14,0,0,28),Position=UDim2.new(0,0,0,40),Text="0",BackgroundColor3=C.BG2,TextSize=12,ZIndex=207}); Corner(xB,6); Stroke(xB,C.BORD,1); Pad(xB,0,0,6,0)
+	local yB=TextBox(pg,{Size=UDim2.new(0.14,0,0,28),Position=UDim2.new(0.15,0,0,40),Text="5",BackgroundColor3=C.BG2,TextSize=12,ZIndex=207}); Corner(yB,6); Stroke(yB,C.BORD,1); Pad(yB,0,0,6,0)
+	local zB=TextBox(pg,{Size=UDim2.new(0.14,0,0,28),Position=UDim2.new(0.30,0,0,40),Text="0",BackgroundColor3=C.BG2,TextSize=12,ZIndex=207}); Corner(zB,6); Stroke(zB,C.BORD,1); Pad(zB,0,0,6,0)
+	local tpCoordBtn=Button(pg,{Size=UDim2.new(0.38,0,0,28),Position=UDim2.new(0.46,0,0,40),BackgroundColor3=Color3.new(C.ACC.R*.16,C.ACC.G*.16,C.ACC.B*.16),Text="📍 TP to Coords",TextSize=11,Font=Enum.Font.GothamBold,TextColor3=C.ACC,ZIndex=207})
+	Corner(tpCoordBtn,6); Stroke(tpCoordBtn,C.ACC,1)
+	tpCoordBtn.MouseButton1Click:Connect(function() if nd() then fire("tptocoords",gSrc(),xB.Text,yB.Text,zB.Text) end end)
+	Hover(tpCoordBtn,Color3.new(C.ACC.R*.16,C.ACC.G*.16,C.ACC.B*.16),Color3.new(C.ACC.R*.28,C.ACC.G*.28,C.ACC.B*.28))
+
+	local cmdSc=Scroll(pg,{Size=UDim2.new(1,0,1,-78),Position=UDim2.new(0,0,0,76),ZIndex=207})
+	ListLayout(cmdSc,Enum.FillDirection.Vertical,8); Pad(cmdSc,2,8,0,0)
+
+	local function addS(t,c,cmds)
+		sectionHeader(cmdSc,t,c)
+		local g=Frame(cmdSc,{BackgroundTransparency=1,Size=UDim2.new(1,0,0,1),AutomaticSize=Enum.AutomaticSize.Y,ZIndex=207})
+		GridLayout(g,UDim2.new(0,174,0,38),UDim2.new(0,5,0,5)); Pad(g,2,4,0,0)
+		for lo,cd in ipairs(cmds) do mkCmdBtn(g,cd[1],cd[2],cd[3],lo) end
+	end
+
+	addS("📍 TELEPORT",C.ACC,{
+		{"📍 Bring",       C.ACC, function() if nd() then fire("bring",gSrc()) end end},
+		{"📍 Goto",        C.ACC, function() if nd() then fire("goto",gSrc()) end end},
+		{"📍 TP→Dest",     C.ACC, function() if nd() and gDst()~="" then fire("teleport",gSrc(),gDst()) end end},
+		{"📍 Bring All",   C.ACC, function() fire("bringall") end},
+		{"🌐 Scatter All", C.PRP, function() fire("scatterall") end},
+		{"📍 All To Me",   C.ACC, function() fire("tp_all_to_me") end},
+		{"🎯 To Center",   C.CYN, function() if nd() then fire("sendtocenter",gSrc()) end end},
+		{"🎲 Random TP",   C.PRP, function() if nd() then fire("randomtp",gSrc()) end end},
+		{"🪂 Skydive",     C.ORG, function() if nd() then fire("skydive",gSrc()) end end},
+		{"☁ Sky Jail",    C.CYN, function() if nd() then fire("skyjail",gSrc()) end end},
+	})
+	addS("✈ FLY (LOCAL)",C.GRN,{
+		{"✈ Toggle Fly",C.GRN,function()
+			if flyOn then
+				flyOn=false
+				if flyConn then flyConn:Disconnect(); flyConn=nil end
+				local char=lp.Character
+				if char then
+					local hrp=char:FindFirstChild("HumanoidRootPart")
+					if hrp then
+						for _,v in ipairs(hrp:GetChildren()) do
+							if v.Name=="PA_FBV" or v.Name=="PA_FBG" then v:Destroy() end
+						end
+					end
+				end
+				notif("✈ Fly OFF","info",2)
+			else
+				flyOn=true
+				local char=lp.Character
+				if not char then notif("No character","error"); flyOn=false; return end
+				local hrp=char:FindFirstChild("HumanoidRootPart")
+				if not hrp then flyOn=false; return end
+				local bv=Instance.new("BodyVelocity",hrp); bv.Name="PA_FBV"
+				bv.MaxForce=Vector3.new(1e9,1e9,1e9); bv.Velocity=Vector3.zero
+				local bg=Instance.new("BodyGyro",hrp); bg.Name="PA_FBG"
+				bg.MaxTorque=Vector3.new(1e9,1e9,1e9); bg.P=9e3; bg.CFrame=hrp.CFrame
+				local cam=WS.CurrentCamera; local spd=65
+				flyConn=Run.Heartbeat:Connect(function()
+					if not flyOn or not char.Parent then if flyConn then flyConn:Disconnect(); flyConn=nil end; return end
+					local d=Vector3.zero
+					if UIS:IsKeyDown(Enum.KeyCode.W) then d=d+cam.CFrame.LookVector end
+					if UIS:IsKeyDown(Enum.KeyCode.S) then d=d-cam.CFrame.LookVector end
+					if UIS:IsKeyDown(Enum.KeyCode.A) then d=d-cam.CFrame.RightVector end
+					if UIS:IsKeyDown(Enum.KeyCode.D) then d=d+cam.CFrame.RightVector end
+					if UIS:IsKeyDown(Enum.KeyCode.Space) then d=d+Vector3.new(0,1,0) end
+					if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then d=d-Vector3.new(0,1,0) end
+					bv.Velocity=d*spd; bg.CFrame=cam.CFrame
+				end)
+				notif("✈ Fly ON — WASD+Space/Shift","success",3)
+			end
+		end},
+	})
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGES: buildGridPage for Effects, Fun, World, Server
+-- ════════════════════════════════════════════════════════════════
+buildGridPage("Effects",{
+	{title="🔥 FIRE & SMOKE",color=C.RED,cmds={
+		{"🔥 Fire",        C.RED, function() if selPlayer then fire("fire",selPlayer) end end},
+		{"🚫 Unfire",      C.T2,  function() if selPlayer then fire("unfire",selPlayer) end end},
+		{"💨 Smoke",       C.T2,  function() if selPlayer then fire("smoke",selPlayer) end end},
+		{"🚫 Unsmoke",     C.T2,  function() if selPlayer then fire("unsmoke",selPlayer) end end},
+		{"✨ Sparkles",    C.PRP, function() if selPlayer then fire("sparkles",selPlayer) end end},
+		{"🚫 Unsparkles",  C.T2,  function() if selPlayer then fire("unsparkles",selPlayer) end end},
+		{"🗑 Clear FX",    C.T2,  function() if selPlayer then fire("cleareffects",selPlayer) end end},
+		{"🗑 Clear All FX",C.RED, function() fire("clearfxall") end},
+	}},
+	{title="🎨 SKINS",color=C.PRP,cmds={
+		{"💛 Gold",        C.YEL, function() if selPlayer then fire("goldify",selPlayer) end end},
+		{"💎 Diamond",     C.CYN, function() if selPlayer then fire("diamond",selPlayer) end end},
+		{"💚 Hacker",      C.GRN, function() if selPlayer then fire("hackerskin",selPlayer) end end},
+		{"🌑 Void",        C.T3,  function() if selPlayer then fire("voidskin",selPlayer) end end},
+		{"🟩 Neon",        C.GRN, function() if selPlayer then fire("neonify",selPlayer) end end},
+		{"👻 Ghost",       C.T2,  function() if selPlayer then fire("ghostify",selPlayer) end end},
+		{"❄ Ice Ghost",   C.CYN, function() if selPlayer then fire("iceghost",selPlayer) end end},
+		{"🌈 Rainbow",     C.PNK, function() if selPlayer then fire("rainbow",selPlayer) end end},
+		{"🌈 Rainbow All", C.PNK, function() fire("rainbowall") end},
+		{"🔄 Reset Look",  C.GRN, function() if selPlayer then fire("resetappearance",selPlayer) end end},
+	}},
+})
+
+buildGridPage("Fun & Chaos",{
+	{title="💥 EXPLOSIONS",color=C.RED,cmds={
+		{"💥 Explode",     C.RED, function() if selPlayer then fire("explode",selPlayer) end end},
+		{"💥 Explode All", C.RED, function() fire("explodeall") end},
+		{"💣 Nuke Area",   C.RED, function() fire("nukearea") end},
+		{"☢ Mega Nuke",   C.RED, function() fire("meganuke") end},
+		{"🌠 Meteors",     C.ORG, function() fire("meteoall") end},
+		{"⫷ Blackhole",   C.PRP, function() fire("blackhole") end},
+		{"🌍 Earthquake",  C.ORG, function() fire("earthquake") end},
+		{"😱 Chaos Mode",  C.RED, function() fire("chaosmode") end},
+		{"🎆 Fireworks",   C.PNK, function() fire("fireworks") end},
+		{"💣 Creeper",     C.GRN, function() if selPlayer then fire("creeper",selPlayer) end end},
+		{"🕊 Release All", C.GRN, function() fire("releaseall") end},
+	}},
+	{title="🎉 PHYSICS",color=C.ORG,cmds={
+		{"💨 Fling",       C.ORG, function() if selPlayer then fire("fling",selPlayer) end end},
+		{"🚀 Launch",      C.CYN, function() if selPlayer then fire("launch",selPlayer) end end},
+		{"🌀 Spin",        C.PRP, function() if selPlayer then fire("spin",selPlayer) end end},
+		{"🪆 Ragdoll",     C.ORG, function() if selPlayer then fire("ragdoll",selPlayer) end end},
+		{"💨 Fling All",   C.RED, function() fire("flingall") end},
+		{"🚀 Launch All",  C.CYN, function() fire("launchall") end},
+		{"🤸 T-Pose",      C.T2,  function() if selPlayer then fire("tpose",selPlayer) end end},
+		{"🪑 Force Sit",   C.T3,  function() if selPlayer then fire("sit",selPlayer) end end},
+	}},
+	{title="👑 SIGNATURE",color=C.YEL,cmds={
+		{"👑 Crown",        C.YEL, function() if selPlayer then fire("crown",selPlayer) end end},
+		{"🌈 Rainbow God",  C.PNK, function() if selPlayer then fire("rainbowgod",selPlayer) end end},
+		{"🔥 Fire God",     C.RED, function() if selPlayer then fire("firegod",selPlayer) end end},
+		{"❄ Ice God",      C.CYN, function() if selPlayer then fire("icegod",selPlayer) end end},
+		{"👻 Phantom Mode", C.PRP, function() if selPlayer then fire("phantommode",selPlayer) end end},
+		{"🥷 Secret Admin", C.T2,  function() fire("secretadmin") end},
+		{"💪 Admin Flex",   C.YEL, function() fire("adminflex") end},
+		{"🔄 Reset Self",   C.GRN, function() fire("resetself") end},
+	}},
+})
+
+buildGridPage("World",{
+	{title="🕐 TIME",color=C.YEL,cmds={
+		{"☀ Day",          C.YEL, function() fire("day") end},
+		{"🌙 Night",        C.CYN, function() fire("night") end},
+		{"🌅 Sunset",       C.ORG, function() fire("sunset") end},
+		{"🌤 Sunrise",      C.YEL, function() fire("sunrise") end},
+		{"⬛ Blackout",     C.T3,  function() fire("blackout") end},
+		{"🔴 Blood Moon",   C.RED, function() fire("bloodmoon") end},
+		{"💚 Matrix",       C.GRN, function() fire("matrixsky") end},
+		{"🌈 Rainbow Sky",  C.PNK, function() fire("rainbowsky") end},
+		{"🔄 Reset Light",  C.GRN, function() fire("resetlighting") end},
+	}},
+	{title="🌫 ATMOSPHERE",color=C.CYN,cmds={
+		{"🌫 Dense Fog",   C.T2,  function() fire("densefog") end},
+		{"✅ Clear Fog",   C.GRN, function() fire("clearfog") end},
+		{"🚨 Red Alert",   C.RED, function() fire("redalert") end},
+		{"🟢 Toxic Fog",   C.GRN, function() fire("toxicfog") end},
+		{"🕺 Disco",       C.PNK, function() fire("disco") end},
+		{"🌩 Strobe",      C.YEL, function() fire("strobe") end},
+	}},
+	{title="🌍 GRAVITY",color=C.PRP,cmds={
+		{"🌍 Normal",      C.GRN, function() fire("normalgravity") end},
+		{"🌙 Moon",        C.T2,  function() fire("moonvity") end},
+		{"⬆ Low",         C.CYN, function() fire("lowgravity") end},
+		{"⬇ High",        C.ORG, function() fire("highgravity") end},
+		{"🚀 Zero-G",      C.ACC, function() fire("zerogravity") end},
+		{"🙃 Flip",        C.RED, function() fire("flipgravity") end},
+	}},
+	{title="📦 SPAWN",color=C.ORG,cmds={
+		{"🟦 Part",        C.CYN, function() fire("spawnpart") end},
+		{"⚽ Ball",        C.ORG, function() fire("spawnball") end},
+		{"🟥 Kill Brick",  C.RED, function() fire("killbrick") end},
+		{"🟩 Heal Pad",    C.GRN, function() fire("healpad") end},
+		{"🤸 Trampoline",  C.YEL, function() fire("spawn_trampoline") end},
+		{"🗑 Clr Spawned", C.RED, function() fire("clearspawned") end},
+	}},
+})
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGE: BUBBLE CHAT
+-- ════════════════════════════════════════════════════════════════
+do
+	local pg = pages["BubbleChat"]
+	Pad(pg,10,10,10,10)
+
+	Label(pg,{Text="💬 Bubble Chat — Speak through any player";TextSize=15;Font=Enum.Font.GothamBlack;TextColor3=C.PNK;Size=UDim2.new(1,0,0,22);ZIndex=207})
+
+	local nameBox = mkInput(pg,"👤 Player (blank = all)",26,0.45)
+	nameBox.Position=UDim2.new(0,0,0,26); nameBox.Size=UDim2.new(0.45,-3,0,30)
+	attachAC(nameBox,nil,"Send bubble to this player?")
+
+	-- Colour buttons
+	local BCOLS={{"white",C.T1},{"red",C.RED},{"green",C.GRN},{"blue",C.CYN},{"yellow",C.YEL},{"purple",C.PRP},{"pink",C.PNK},{"orange",C.ORG},{"gold",Color3.fromRGB(255,215,0)}}
+	local selCol={"white"}
+	local colRow=Frame(pg,{Size=UDim2.new(0.54,-3,0,30),Position=UDim2.new(0.46,0,0,26),BackgroundTransparency=1,ZIndex=207})
+	ListLayout(colRow,Enum.FillDirection.Horizontal,4)
+	local cBtns={}
+	for _,bc in ipairs(BCOLS) do
+		local cb=Frame(colRow,{Size=UDim2.new(0,24,1,0),BackgroundColor3=bc[2],ZIndex=208})
+		Corner(cb,5)
+		local cSel=Button(cb,{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text="",ZIndex=209})
+		cBtns[bc[1]]={f=cb,c=bc[2]}
+		cSel.MouseButton1Click:Connect(function()
+			selCol[1]=bc[1]
+			for k,v in pairs(cBtns) do Stroke(v.f,k==bc[1] and Color3.new(1,1,1) or v.c,k==bc[1] and 2.5 or 0) end
+		end)
+	end
+
+	local msgBox=TextBox(pg,{Size=UDim2.new(1,0,0,48),Position=UDim2.new(0,0,0,64),PlaceholderText="💬 Type your message here...",PlaceholderColor3=C.T3,Text="",BackgroundColor3=C.BG2,TextSize=14,ZIndex=207})
+	Corner(msgBox,8); Stroke(msgBox,C.PNK,1.5); Pad(msgBox,0,0,10,0)
+	msgBox.Focused:Connect(function() Stroke(msgBox,C.PNK,2) end)
+	msgBox.FocusLost:Connect(function() Stroke(msgBox,C.PNK,1.5) end)
+
+	local function doSend(targets)
+		local m=msgBox.Text
+		if m=="" then notif("⚠ Type a message!","warning"); return end
+		local col=selCol[1]
+		for _,name in ipairs(targets) do fire("bubblechat",name,m,col,"14","8") end
+		notif("💬 Sent to "..#targets.." player(s)!","success",2)
+	end
+	local function getTargets()
+		local n=nameBox.Text
+		if n~="" then return{n} end
+		local a={}; for _,p in ipairs(Players:GetPlayers()) do a[#a+1]=p.Name end; return a
+	end
+
+	-- Quick phrases
+	local phrases={"LOL 😂","I am the admin 😈","No escape 😈","BOW DOWN 👑","⚡ A.APK.PANEL","You're done 💀","GG ez 😎","Skill issue 💀","Watch yourself 👁","Get rekt 😂"}
+	local phraseSc=Scroll(pg,{Size=UDim2.new(1,0,0,60),Position=UDim2.new(0,0,0,120),ZIndex=207,ScrollBarThickness=0})
+	GridLayout(phraseSc,UDim2.new(0,140,0,24),UDim2.new(0,4,0,4)); Pad(phraseSc,2,2,2,2)
+	for lo,p in ipairs(phrases) do
+		local pb=Button(phraseSc,{Text=p,TextSize=10,BackgroundColor3=C.BG3,LayoutOrder=lo,ZIndex=208,Font=Enum.Font.GothamMedium})
+		Corner(pb,5); Stroke(pb,C.BORD,1); Hover(pb,C.BG3,C.BG4)
+		pb.MouseButton1Click:Connect(function() msgBox.Text=p end)
+	end
+
+	local btnRow=Frame(pg,{Size=UDim2.new(1,0,0,36),Position=UDim2.new(0,0,0,188),BackgroundTransparency=1,ZIndex=207})
+	ListLayout(btnRow,Enum.FillDirection.Horizontal,8)
+	local function mkBtnB(text,col,fn)
+		local b=Button(btnRow,{Size=UDim2.new(0,0,1,0),AutomaticSize=Enum.AutomaticSize.X,BackgroundColor3=Color3.new(col.R*.18,col.G*.18,col.B*.18),Text=text,TextSize=13,Font=Enum.Font.GothamBlack,TextColor3=col,ZIndex=208})
+		Corner(b,8); Stroke(b,col,1.5); Pad(b,0,0,12,12); Hover(b,Color3.new(col.R*.18,col.G*.18,col.B*.18),Color3.new(col.R*.32,col.G*.32,col.B*.32))
+		b.MouseButton1Click:Connect(fn); return b
+	end
+	mkBtnB("💬 Send",   C.PNK, function() doSend(getTargets()) end)
+	mkBtnB("📢 All",    C.CYN, function() local a={};for _,p in ipairs(Players:GetPlayers())do a[#a+1]=p.Name end;doSend(a) end)
+	mkBtnB("🔁 Spam×5", C.ORG, function() local t=getTargets();for i=1,5 do task.delay(i*.6,function()doSend(t)end)end end)
+	mkBtnB("🧹 Clear",  C.T2,  function() msgBox.Text="" end)
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGE: EVENTS
+-- ════════════════════════════════════════════════════════════════
+do
+	local pg = pages["Events"]
+	Pad(pg,10,10,10,10)
+
+	local statusLbl=Label(pg,{Text="⏳ Connecting to event system...";TextSize=11;Font=Enum.Font.GothamMedium;TextColor3=C.T3;Size=UDim2.new(1,0,0,18);ZIndex=207})
+	task.spawn(function()
+		while SG.Parent do
+			if TriggerEv and EventUpd then
+				statusLbl.Text="✅ Event system ready"
+				statusLbl.TextColor3=C.GRN
+			else
+				TriggerEv=RS:FindFirstChild("TriggerEvent")
+				EventUpd=RS:FindFirstChild("EventUpdate")
+				statusLbl.Text="⚠ Event remotes not found — ensure server script is running"
+				statusLbl.TextColor3=C.YEL
+			end
+			task.wait(3)
+		end
+	end)
+
+	local annBox=TextBox(pg,{Size=UDim2.new(1,0,0,30),Position=UDim2.new(0,0,0,26),PlaceholderText="📢 Announcement text (optional)...",PlaceholderColor3=C.T3,Text="",BackgroundColor3=C.BG2,TextSize=13,ZIndex=207})
+	Corner(annBox,7); Stroke(annBox,C.BORD,1.2); Pad(annBox,0,0,10,0)
+
+	local EVTS={
+		{n="Flood",       i="🌊",c=C.CYN},
+		{n="Blood",       i="🩸",c=C.RED},
+		{n="MeteorShower",i="☄",c=C.ORG},
+		{n="Blackhole",   i="⚫",c=C.PRP},
+		{n="Taco",        i="🌮",c=C.YEL},
+		{n="DJ",          i="🎧",c=C.PNK},
+	}
+	local selEvt=nil
+	local evtBtns={}
+
+	Label(pg,{Text="Select Event:";TextSize=10;TextColor3=C.T3;Font=Enum.Font.GothamBold;Size=UDim2.new(0,120,0,14);Position=UDim2.new(0,0,0,64);ZIndex=207})
+	local evtGrid=Frame(pg,{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,0,80),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1,ZIndex=207})
+	GridLayout(evtGrid,UDim2.new(0,168,0,54),UDim2.new(0,6,0,6)); Pad(evtGrid,2,2,0,0)
+
+	for lo,ev in ipairs(EVTS) do
+		local col=ev.c
+		local dim=Color3.new(col.R*.14,col.G*.14,col.B*.14)
+		local btn=Button(evtGrid,{Text=ev.i.."  "..ev.n,BackgroundColor3=dim,TextColor3=col,TextSize=13,Font=Enum.Font.GothamBlack,LayoutOrder=lo,ZIndex=208})
+		Corner(btn,10); Stroke(btn,Color3.new(col.R*.3,col.G*.3,col.B*.3),1.5)
+		Hover(btn,dim,Color3.new(col.R*.26,col.G*.26,col.B*.26))
+		btn.MouseButton1Click:Connect(function()
+			if selEvt==ev.n then
+				selEvt=nil; tween(btn,{BackgroundColor3=dim},.15)
+			else
+				selEvt=ev.n
+				for k,v in pairs(evtBtns) do
+					local vc=v.c; tween(v.b,{BackgroundColor3=Color3.new(vc.R*.14,vc.G*.14,vc.B*.14)},.15)
+				end
+				tween(btn,{BackgroundColor3=Color3.new(col.R*.35,col.G*.35,col.B*.35)},.15)
+			end
+		end)
+		evtBtns[ev.n]={b=btn,c=col}
+	end
+
+	local launchRow=Frame(pg,{Size=UDim2.new(1,0,0,36),Position=UDim2.new(0,0,0,206),BackgroundTransparency=1,ZIndex=207})
+	ListLayout(launchRow,Enum.FillDirection.Horizontal,8)
+	local function launchEvent(scope)
+		if not TriggerEv then notif("❌ TriggerEvent remote not found","error"); return end
+		local ann=annBox.Text
+		if not selEvt and ann=="" then notif("⚠ Select an event or type an announcement","warning"); return end
+		TriggerEv:FireServer(scope, selEvt, ann~="" and ann or nil)
+		notif("🚀 Launched: "..(selEvt or "Announcement").." ["..scope.."]","success",4)
+		annBox.Text=""
+	end
+	local function mkLaunchBtn(text,col,scope)
+		local b=Button(launchRow,{Size=UDim2.new(0,190,1,0),BackgroundColor3=Color3.new(col.R*.18,col.G*.18,col.B*.18),Text=text,TextSize=14,Font=Enum.Font.GothamBlack,TextColor3=col,ZIndex=208})
+		Corner(b,8); Stroke(b,col,1.5); Hover(b,Color3.new(col.R*.18,col.G*.18,col.B*.18),Color3.new(col.R*.32,col.G*.32,col.B*.32))
+		b.MouseButton1Click:Connect(function() launchEvent(scope) end)
+	end
+	mkLaunchBtn("🖥 Launch → Server",C.GRN,"SERVER")
+	mkLaunchBtn("🌐 Launch → Global",C.ORG,"GLOBAL")
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGE: SERVER
+-- ════════════════════════════════════════════════════════════════
+do
+	local pg=pages["Server"]; Pad(pg,10,10,10,10)
+	local infoLbl=Label(pg,{Text="Loading...";TextSize=11;Font=Enum.Font.GothamMedium;TextColor3=C.T2;Size=UDim2.new(1,0,0,18);ZIndex=207;TextWrapped=true})
+	task.spawn(function() while SG.Parent do infoLbl.Text=string.format("👥 %d/%d players  ·  🌍 Gravity %.1f  ·  🕐 %.1fh  ·  Place %d",#Players:GetPlayers(),Players.MaxPlayers,WS.Gravity,Lighting.ClockTime,game.PlaceId); task.wait(2) end end)
+
+	local msgBox=TextBox(pg,{Size=UDim2.new(1,0,0,30),Position=UDim2.new(0,0,0,26),PlaceholderText="Broadcast message...",PlaceholderColor3=C.T3,Text="",BackgroundColor3=C.BG2,TextSize=13,ZIndex=207})
+	Corner(msgBox,7); Stroke(msgBox,C.BORD,1.2); Pad(msgBox,0,0,10,0)
+	local mRow=Frame(pg,{Size=UDim2.new(1,0,0,28),Position=UDim2.new(0,0,0,62),BackgroundTransparency=1,ZIndex=207})
+	ListLayout(mRow,Enum.FillDirection.Horizontal,6)
+	local function sm(cmd) local t=msgBox.Text; if t=="" then notif("Type something!","warning"); return end; fire(cmd,t); notif("✅ Sent!","success",2) end
+	for _,d in ipairs({{"💬 Announce",C.GRN,"message"},{"💡 Hint",C.CYN,"hint"},{"📣 Global",C.PRP,"announcement"}}) do
+		local b=Button(mRow,{Size=UDim2.new(0,0,1,0),AutomaticSize=Enum.AutomaticSize.X,BackgroundColor3=Color3.new(d[2].R*.18,d[2].G*.18,d[2].B*.18),Text=d[1],TextSize=11,Font=Enum.Font.GothamBold,TextColor3=d[2],ZIndex=208})
+		Corner(b,7); Stroke(b,d[2],1); Pad(b,0,0,8,8); Hover(b,Color3.new(d[2].R*.18,d[2].G*.18,d[2].B*.18),Color3.new(d[2].R*.32,d[2].G*.32,d[2].B*.32))
+		b.MouseButton1Click:Connect(function()sm(d[3])end)
+	end
+
+	buildGridPage("Server",{
+		{title="🖥 CONTROLS",color=C.T2,cmds={
+			{"🔒 Lock Server",C.ORG,function()fire("lockserver")end},
+			{"🔓 Unlock Srv", C.GRN,function()fire("unlockserver")end},
+			{"🔕 Lock Chat",  C.YEL,function()fire("lockchat")end},
+			{"🔔 Unlock Chat",C.GRN,function()fire("unlockchat")end},
+			{"🗑 Clear WS",   C.RED,function()fire("clearworkspace")end},
+			{"📊 Server Info",C.CYN,function()fire("serverinfo")end},
+			{"📋 List Plrs",  C.T2, function()fire("listplayers")end},
+			{"🏓 Ping",       C.GRN,function()fire("ping")end},
+			{"🛑 Shutdown",   C.RED,function()fire("shutdown","5")end},
+			{"🎵 Stop Music", C.T2, function()fire("stopmusic")end},
+		}},
+	})
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  PAGE: SETTINGS
+-- ════════════════════════════════════════════════════════════════
+do
+	local pg=pages["Settings"]; Pad(pg,14,14,14,14)
+	Label(pg,{Text="⚙ Settings & Admin Management";TextSize=16;Font=Enum.Font.GothamBlack;TextColor3=C.T1;Size=UDim2.new(1,0,0,24);ZIndex=207})
+
+	local promBox=mkInput(pg,"Player name...",36,0.45)
+	promBox.Position=UDim2.new(0,0,0,36); promBox.Size=UDim2.new(0.45,-3,0,30)
+	attachAC(promBox,nil,"Promote/demote this player?")
+
+	local ranks={"Mod","Admin","HeadAdmin"}; local rankCols={Mod=C.GRN,Admin=C.RED,HeadAdmin=C.YEL}; local selRank={"Admin"}
+	local rankRow=Frame(pg,{Size=UDim2.new(0.54,0,0,30),Position=UDim2.new(0.46,0,0,36),BackgroundTransparency=1,ZIndex=207}); ListLayout(rankRow,Enum.FillDirection.Horizontal,5)
+	local rBtns={}
+	for _,rn in ipairs(ranks) do
+		local rc=rankCols[rn]; local rb=Button(rankRow,{Size=UDim2.new(0,0,1,0),AutomaticSize=Enum.AutomaticSize.X,Text=rn,TextSize=11,TextColor3=rc,BackgroundColor3=Color3.new(rc.R*.15,rc.G*.15,rc.B*.15),ZIndex=208,Font=Enum.Font.GothamBold})
+		Corner(rb,6); Stroke(rb,rc,1.2); Pad(rb,0,0,8,8)
+		rb.MouseButton1Click:Connect(function() selRank[1]=rn; for k,v in pairs(rBtns) do tween(v.b,{BackgroundColor3=k==rn and Color3.new(v.c.R*.32,v.c.G*.32,v.c.B*.32) or Color3.new(v.c.R*.15,v.c.G*.15,v.c.B*.15)},.15) end end)
+		rBtns[rn]={b=rb,c=rc}
+	end
+
+	local pRow=Frame(pg,{Size=UDim2.new(0.5,0,0,28),Position=UDim2.new(0,0,0,74),BackgroundTransparency=1,ZIndex=207}); ListLayout(pRow,Enum.FillDirection.Horizontal,6)
+	local pb=Button(pRow,{Size=UDim2.new(0,120,1,0),BackgroundColor3=Color3.new(C.GRN.R*.18,C.GRN.G*.18,C.GRN.B*.18),Text="✅ Promote",TextSize=12,Font=Enum.Font.GothamBold,TextColor3=C.GRN,ZIndex=208}); Corner(pb,7); Stroke(pb,C.GRN,1); Hover(pb,Color3.new(C.GRN.R*.18,C.GRN.G*.18,C.GRN.B*.18),Color3.new(C.GRN.R*.32,C.GRN.G*.32,C.GRN.B*.32))
+	pb.MouseButton1Click:Connect(function() local n=promBox.Text; if n=="" then notif("Enter name","warning"); return end; fire("promote",n,selRank[1]); notif("✅ Promoted "..n.." → "..selRank[1],"success") end)
+	local db=Button(pRow,{Size=UDim2.new(0,110,1,0),BackgroundColor3=Color3.new(C.RED.R*.18,C.RED.G*.18,C.RED.B*.18),Text="🚫 Demote",TextSize=12,Font=Enum.Font.GothamBold,TextColor3=C.RED,ZIndex=208}); Corner(db,7); Stroke(db,C.RED,1); Hover(db,Color3.new(C.RED.R*.18,C.RED.G*.18,C.RED.B*.18),Color3.new(C.RED.R*.32,C.RED.G*.32,C.RED.B*.32))
+	db.MouseButton1Click:Connect(function() local n=promBox.Text; if n=="" then notif("Enter name","warning"); return end; fire("demote",n); notif("Demoted "..n,"info") end)
+
+	local aboutLbl=Label(pg,{Text="A.APK.PANEL v12 — Complete Edition\nOwner: Kshusha319 · ID: 6136351097\n\n] or F4 — Open/Close panel\nAll commands send through AdminCommand remote\nServer: AAPK_SERVER_v11_FINAL (unchanged)";TextSize=12;Font=Enum.Font.GothamMedium;TextColor3=C.T3;Size=UDim2.new(1,0,0,0);AutomaticSize=Enum.AutomaticSize.Y;Position=UDim2.new(0,0,0,118);ZIndex=207;TextWrapped=true})
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  TOGGLE BUTTON CLICK
+-- ════════════════════════════════════════════════════════════════
+toggleBtn.MouseButton1Click:Connect(function()
+	if not adminOK then notif("⚠ Not verified as admin","warning"); return end
+	if panelOpen then closePanel()
+	else
+		openPanel()
+		if activeTab == nil or activeTab == "" then switchTab("Players") end
+	end
+end)
+
+-- ════════════════════════════════════════════════════════════════
+--  KEYBOARD SHORTCUTS
+-- ════════════════════════════════════════════════════════════════
+UIS.InputBegan:Connect(function(inp, gpe)
+	if gpe then return end
+	if inp.KeyCode == Enum.KeyCode.RightBracket or inp.KeyCode == Enum.KeyCode.F4 then
+		if not adminOK then return end
+		if panelOpen then closePanel() else openPanel(); if not activeTab or activeTab=="" then switchTab("Players") end end
+	end
+	if inp.KeyCode == Enum.KeyCode.Escape then
+		if panelOpen then closePanel() end
+	end
+end)
+
+-- ════════════════════════════════════════════════════════════════
+--  NOTIFICATION HANDLER (from server)
+-- ════════════════════════════════════════════════════════════════
+task.spawn(function()
+	local tries = 0
+	while not AdminNotif and tries < 60 do task.wait(0.5); tries=tries+1 end
+	if not AdminNotif then warn("[A.APK.PANEL] AdminNotif not found"); return end
+
+	AdminNotif.OnClientEvent:Connect(function(msg, typ)
+		if typ == "bubble" then
+			-- Client-side bubble creation
+			local text = tostring(msg):match("BUBBLE:(.+)|COL:") or tostring(msg):match("BUBBLE:(.+)$") or ""
+			local col  = tostring(msg):match("|COL:([^|]+)") or "white"
+			local size = tonumber(tostring(msg):match("|SIZE:([^|]+)")) or 14
+			local dur  = tonumber(tostring(msg):match("|DUR:([^|]+)"))  or 8
+			local by   = tostring(msg):match("|BY:([^|]+)") or ""
+
+			local char = lp.Character
+			local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+			if not hrp then return end
+
+			local old = hrp:FindFirstChild("PA_Bubble"); if old then old:Destroy() end
+			local bb  = Instance.new("BillboardGui", hrp)
+			bb.Name="PA_Bubble"; bb.StudsOffset=Vector3.new(0,8,0)
+			bb.Size=UDim2.new(0,300,0,54); bb.MaxDistance=80
+			game:GetService("Debris"):AddItem(bb, dur+1)
+
+			local bg=Instance.new("Frame",bb); bg.Size=UDim2.new(1,0,0,46)
+			bg.BackgroundColor3=Color3.fromRGB(8,8,20); bg.BorderSizePixel=0
+			Corner(bg,12); Stroke(bg,C.ACC,1.5)
+			local lbl=Instance.new("TextLabel",bg)
+			lbl.Size=UDim2.new(1,-12,1,0); lbl.Position=UDim2.new(0,6,0,0)
+			lbl.BackgroundTransparency=1; lbl.Text=text
+			lbl.Font=Enum.Font.GothamBold; lbl.TextSize=size
+			lbl.TextColor3=Color3.fromRGB(235,240,255); lbl.TextWrapped=true
+			lbl.BorderSizePixel=0
+
+			TS:Create(bb,TweenInfo.new(.3,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{Size=UDim2.new(0,300,0,54)}):Play()
+			task.delay(dur-1,function() if bb.Parent then TS:Create(bg,TweenInfo.new(.6),{BackgroundTransparency=1}):Play() end end)
+
+		elseif typ == "bubble_remote" then
+			local tName= tostring(msg):match("^BUBBLE_REMOTE:([^|]+)")
+			local text = tostring(msg):match("|MSG:([^|]+)") or ""
+			local size = tonumber(tostring(msg):match("|SIZE:([^|]+)")) or 14
+			local dur  = tonumber(tostring(msg):match("|DUR:([^|]+)"))  or 8
+			if not tName then return end
+			local tp = Players:FindFirstChild(tName)
+			local char = tp and tp.Character
+			local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+			if not hrp then return end
+			local old=hrp:FindFirstChild("PA_Bubble"); if old then old:Destroy() end
+			local bb=Instance.new("BillboardGui",hrp); bb.Name="PA_Bubble"
+			bb.StudsOffset=Vector3.new(0,8,0); bb.Size=UDim2.new(0,280,0,50); bb.MaxDistance=80
+			game:GetService("Debris"):AddItem(bb,dur+1)
+			local bg=Instance.new("Frame",bb); bg.Size=UDim2.new(1,0,0,42); bg.BackgroundColor3=Color3.fromRGB(8,8,20); bg.BorderSizePixel=0
+			Corner(bg,12); Stroke(bg,C.ACC,1.5)
+			local lbl=Instance.new("TextLabel",bg); lbl.Size=UDim2.new(1,-12,1,0); lbl.Position=UDim2.new(0,6,0,0)
+			lbl.BackgroundTransparency=1; lbl.Text=text; lbl.Font=Enum.Font.GothamBold; lbl.TextSize=size
+			lbl.TextColor3=Color3.fromRGB(235,240,255); lbl.TextWrapped=true; lbl.BorderSizePixel=0
+
+		elseif typ == "blind" then
+			if blindFr then return end
+			blindFr = Frame(SG,{Size=UDim2.new(1,0,1,0),BackgroundColor3=Color3.new(0,0,0),ZIndex=99000})
+		elseif typ == "unblind" then
+			if blindFr then blindFr:Destroy(); blindFr=nil end
+		elseif typ == "nightvision" then
+			Lighting.Brightness=3; Lighting.Ambient=Color3.fromRGB(60,255,60)
+			notif("🌙 Night Vision ON","success",2)
+		elseif typ == "unnightvision" then
+			Lighting.Brightness=2; Lighting.Ambient=Color3.fromRGB(70,70,70)
+			notif("🌙 Night Vision OFF","info",2)
+		elseif typ == "spectate" then
+			local tName=tostring(msg):match("SPECTATE:(.+)"); if not tName then return end
+			if specConn then specConn:Disconnect(); specConn=nil end
+			WS.CurrentCamera.CameraType=Enum.CameraType.Scriptable
+			specConn=Run.Heartbeat:Connect(function()
+				local t=Players:FindFirstChild(tName)
+				local h=t and t.Character and t.Character:FindFirstChild("Head")
+				if h then WS.CurrentCamera.CFrame=h.CFrame*CFrame.new(0,2,7)*CFrame.Angles(-0.15,0,0) end
+			end)
+			notif("🔭 Spectating "..tName.." — Esc to stop","info",5)
+		else
+			notif(tostring(msg or ""), typ or "info")
+		end
+	end)
+end)
+
+-- ════════════════════════════════════════════════════════════════
+--  ADMIN VERIFICATION
+-- ════════════════════════════════════════════════════════════════
+local function grantUI()
+	if adminOK then return end
+	adminOK = true
+	toggleBtn.Visible = true
+	glowRing.Visible  = true
+	switchTab("Players")
+	notif("⚡ A.APK.PANEL v12 — Ready!  ] or F4 to open","success",6)
+end
+
+-- Owner gets button instantly
+if amOwner() then task.delay(0.5, grantUI) end
+
+-- Key system auth signal
+local function checkKeyAuth()
+	local s = RS:FindFirstChild("AAPK_AuthGranted")
+	return s and s.Value == true
+end
+
+-- Poll for server-side admin grant
+task.spawn(function()
+	task.wait(2)
+	local retries = 0
+	while SG.Parent do
+		if checkKeyAuth() then
+			grantUI()
+		elseif AdminQuery then
+			local ok, res = pcall(function() return AdminQuery:InvokeServer("isAdmin") end)
+			if ok and res and res.isAdmin then
+				grantUI(); retries = 0
+			else
+				retries = retries + 1
+				if retries >= 4 and not amOwner() and not checkKeyAuth() then
+					adminOK = false
+					toggleBtn.Visible = false
+					glowRing.Visible  = false
+					if panelOpen then closePanel() end
+				end
+			end
+		elseif amOwner() then
+			grantUI()
+		end
+		task.wait(6)
+	end
+end)
+
+-- Set default tab
+switchTab("Players")
+
+print("╔═══════════════════════════════════════════════╗")
+print("║  A.APK.PANEL v12 CLIENT ✅  LOADED            ║")
+print("║  ] or F4 to open  ·  All remotes: BLOCKING    ║")
+print("║  fire() is clean  ·  No broken overrides      ║")
+print("╚═══════════════════════════════════════════════╝")
